@@ -1,13 +1,14 @@
 {
-  "BrushFlow": {
+  "BrushFlowLanduo": {
     "name": "站点刷流-landuo",
     "description": "自动托管刷流，将会提高对应站点的访问频率。",
     "labels": "刷流,仪表板",
-    "version": "4.3.5",
+    "version": "4.3.6",
     "icon": "brush.jpg",
     "author": "landuo",
     "level": 2,
     "history": {
+      "v4.3.6": "landuo 定制版，避免同站点同标题不同内容的种子被误判为重复",
       "v4.3.5": "提升匹配规则时的健壮性",
       "v4.3.4": "添加RSS支持配置选项",
       "v4.3.2": "增加'删除促销结束的未完成下载'功能",
