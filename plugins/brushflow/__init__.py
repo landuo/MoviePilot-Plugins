@@ -260,7 +260,7 @@ class BrushFlow(_PluginBase):
     # 插件版本
     plugin_version = "3.8"
     # 插件作者
-    plugin_author = "jxxghp,InfinityPacer"
+    plugin_author = "landuo"
     # 作者主页
     author_url = "https://github.com/InfinityPacer"
     # 插件配置项ID前缀
