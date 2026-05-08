@@ -2223,16 +2223,17 @@ class BrushFlow(_PluginBase):
         brush_config = self.__get_brush_config(torrent.site_name)
 
         # 排除重复种子
-        # 默认根据标题和站点名称进行排除
-        task_key = f"{torrent.site_name}{torrent.title}"
-        if any(task_key == f"{task.get('site_name')}{task.get('title')}" for task in torrent_tasks.values()):
-            return False, "重复种子"
-
-        # 部分站点标题会上新时携带后缀，这里进一步根据种子详情地址进行排除
+        # 优先使用详情页地址排重，避免同站点同标题但不同内容的种子被误判为重复
         if torrent.page_url:
             task_page_url = f"{torrent.site_name}{torrent.page_url}"
             if any(task_page_url == f"{task.get('site_name')}{task.get('page_url')}" for task in
                    torrent_tasks.values()):
+                return False, "重复种子"
+        else:
+            # 没有详情页地址时，回退到更严格的内容指纹排重
+            task_fingerprint = (torrent.site_name, torrent.title, torrent.size, torrent.description)
+            if any(task_fingerprint == (task.get("site_name"), task.get("title"), task.get("size"),
+                                         task.get("description")) for task in torrent_tasks.values()):
                 return False, "重复种子"
 
         # 不同站点如果遇到相同种子，判断前一个种子是否已经在做种，否则排除处理
