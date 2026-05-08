@@ -423,7 +423,7 @@
     }
   },
   "BrushFlow": {
-    "name": "站点刷流",
+    "name": "站点刷流-landuo",
     "description": "自动托管刷流，将会提高对应站点的访问频率。",
     "labels": "刷流,仪表板",
     "version": "3.8",
