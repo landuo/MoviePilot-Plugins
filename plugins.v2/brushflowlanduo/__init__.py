@@ -1289,7 +1289,11 @@ class BrushFlowLanduo(_PluginBase):
             return
         torrent_tasks: Dict[str, dict] = self._current_task_data("torrents", {})
         seeding_size = self.__calculate_seeding_torrents_size(torrent_tasks)
-        global_seeding_size = self._calculate_global_seeding_size(task.id, torrent_tasks)
+        global_seeding_size = (
+            self._calculate_global_downloader_size()
+            if getattr(self, "_global_disksize", None)
+            else 0.0
+        )
         passed, reason = self.__evaluate_size_condition_for_brush(
             seeding_size,
             global_torrents_size=global_seeding_size,
@@ -1324,19 +1328,22 @@ class BrushFlowLanduo(_PluginBase):
             rows.update(task_rows)
         return rows
 
-    def _calculate_global_seeding_size(
-        self,
-        current_task_id: Optional[str] = None,
-        current_torrent_tasks: Optional[Dict[str, dict]] = None,
-    ) -> float:
-        """汇总所有任务未删除种子的体积，并允许使用当前任务的内存快照。"""
+    def _calculate_global_downloader_size(self) -> float:
+        """按下载器去重汇总全部种子的实时总体积。"""
         total_size = 0.0
-        for task_id in self._task_configs:
-            if task_id == current_task_id and current_torrent_tasks is not None:
-                task_rows = current_torrent_tasks
+        downloader_names = {task.downloader for task in self._task_configs.values() if task.downloader}
+        downloader_helper = DownloaderHelper()
+        for downloader_name in downloader_names:
+            service = downloader_helper.get_service(name=downloader_name)
+            if not service or not service.instance or service.instance.is_inactive():
+                raise RuntimeError(f"无法获取下载器 [{downloader_name}] 实时种子体积")
+            torrents, error = service.instance.get_torrents()
+            if error:
+                raise RuntimeError(f"获取下载器 [{downloader_name}] 种子失败")
+            if downloader_helper.is_downloader("qbittorrent", service=service):
+                total_size += sum(float(torrent.get("total_size") or 0) for torrent in torrents or [])
             else:
-                task_rows = self._get_task_data(task_id, "torrents") or {}
-            total_size += self.__calculate_seeding_torrents_size(task_rows)
+                total_size += sum(float(getattr(torrent, "total_size", 0) or 0) for torrent in torrents or [])
         return total_size
 
     def __brush_site_torrents(
@@ -1373,7 +1380,6 @@ class BrushFlowLanduo(_PluginBase):
                 break
             passed, reason = self.__evaluate_size_condition_for_brush(
                 seeding_size,
-                torrent.size,
                 global_torrents_size=global_seeding_size,
             )
             if not passed:
@@ -1468,31 +1474,28 @@ class BrushFlowLanduo(_PluginBase):
     def __evaluate_size_condition_for_brush(
         self,
         torrents_size: float,
-        add_torrent_size: float = 0.0,
         global_torrents_size: Optional[float] = None,
     ) -> Tuple[bool, Optional[str]]:
-        """校验当前任务及所有任务新增种子后是否超过保种体积。"""
+        """校验当前任务及下载器实际种子体积是否已达到上限。"""
         task = self._get_task_config()
         if not task:
             return False, "任务配置不存在"
-        estimated_size = torrents_size + (add_torrent_size or 0)
         if task.disksize:
             limit_size = float(task.disksize) * 1024 ** 3
-            if estimated_size > limit_size:
+            if torrents_size >= limit_size:
                 reason = (
-                    f"预计做种体积 {self.__bytes_to_gb(estimated_size):.1f} GB，"
-                    f"超过任务保种上限 {task.disksize} GB"
+                    f"当前做种体积 {self.__bytes_to_gb(torrents_size):.1f} GB，"
+                    f"已达到任务保种上限 {task.disksize} GB"
                 )
                 return False, reason
         global_disksize = getattr(self, "_global_disksize", None)
         if global_disksize:
             if global_torrents_size is None:
-                global_torrents_size = self._calculate_global_seeding_size()
-            estimated_global_size = global_torrents_size + (add_torrent_size or 0)
-            if estimated_global_size > float(global_disksize) * 1024 ** 3:
+                global_torrents_size = self._calculate_global_downloader_size()
+            if global_torrents_size >= float(global_disksize) * 1024 ** 3:
                 reason = (
-                    f"预计全局做种体积 {self.__bytes_to_gb(estimated_global_size):.1f} GB，"
-                    f"超过全局保种上限 {global_disksize} GB"
+                    f"下载器当前种子总体积 {self.__bytes_to_gb(global_torrents_size):.1f} GB，"
+                    f"已达到全局保种上限 {global_disksize} GB"
                 )
                 return False, reason
         return True, None
