@@ -249,7 +249,14 @@ async function saveTask() {
                     <VTextField v-model="localTask.pubtime" label="发布时间（分钟）" placeholder="5-120" />
                   </VCol>
                   <VCol cols="12" md="4">
-                    <VTextField v-model.number="localTask.timezone_offset" type="number" label="站点时区偏移（小时）" />
+                    <VTextField
+                      v-model.number="localTask.timezone_offset"
+                      type="number"
+                      label="站点时区偏移（小时，留 0 自动推导）"
+                      placeholder="站点时间 + 偏移 = 本机时间"
+                      hint="例如站点用 UTC、本机为 UTC+8 时填 8"
+                      persistent-hint
+                    />
                   </VCol>
                   <VCol cols="12" md="8">
                     <VTextField v-model="localTask.include" label="包含规则" placeholder="支持正则表达式" />
@@ -368,6 +375,19 @@ async function saveTask() {
                   hide-details
                   inset
                 />
+                <VRow v-if="localTask.del_no_free" class="mt-2">
+                  <VCol cols="12" md="4">
+                    <VTextField
+                      v-model.number="localTask.promo_max_hours"
+                      type="number"
+                      min="0"
+                      label="促销最长时长（小时，可选）"
+                      placeholder="留空则不兜底"
+                      hint="站点未给出促销截止时间时，超过该时长仍未完成的种子将被删除"
+                      persistent-hint
+                    />
+                  </VCol>
+                </VRow>
               </section>
             </VWindowItem>
 

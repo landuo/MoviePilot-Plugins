@@ -62,6 +62,7 @@ class BrushTaskPayload(BaseModel):
     except_subscribe: bool = True
     proxy_delete: bool = False
     del_no_free: bool = False
+    promo_max_hours: Optional[float] = Field(None, gt=0)
     qb_category: Optional[str] = None
     site_hr_active: bool = False
     site_skip_tips: bool = False
@@ -83,6 +84,7 @@ class BrushTaskPayload(BaseModel):
         "up_speed",
         "dl_speed",
         "auto_archive_days",
+        "promo_max_hours",
         mode="before",
     )
     @classmethod

@@ -39,6 +39,7 @@ const taskDefaults = {
   except_subscribe: true,
   proxy_delete: false,
   del_no_free: false,
+  promo_max_hours: null,
   qb_category: null,
   site_hr_active: false,
   site_skip_tips: false,
@@ -78,6 +79,7 @@ function normalizeTask(task) {
     'up_speed',
     'dl_speed',
     'auto_archive_days',
+    'promo_max_hours',
   ];
   const optionalText = [
     'cron',

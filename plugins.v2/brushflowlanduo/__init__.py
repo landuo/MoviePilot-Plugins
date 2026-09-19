@@ -1,12 +1,14 @@
 import base64
+import calendar
 import json
+import random
 import re
 import threading
 import time
 import uuid
 from collections import Counter
 from contextlib import contextmanager
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, Iterator, List, Optional, Set, Tuple, Union
 from urllib.parse import parse_qs, parse_qsl, unquote, urlencode, urljoin, urlparse, urlunparse
 from zoneinfo import ZoneInfo
@@ -33,7 +35,7 @@ from app.plugins import _PluginBase
 from app.scheduler import Scheduler
 from app.schemas import MediaType, NotificationType, ServiceInfo, TorrentInfo
 from app.schemas.types import EventType
-from app.utils.http import RequestUtils
+from app.utils.http import RequestUtils, cookie_parse
 from app.utils.string import StringUtils
 
 from .models import BrushFlowSettingsPayload, BrushTaskPayload, BrushTaskStatePayload
@@ -78,6 +80,7 @@ TASK_CONFIG_FIELDS = (
     "except_subscribe",
     "proxy_delete",
     "del_no_free",
+    "promo_max_hours",
     "qb_category",
     "site_hr_active",
     "site_skip_tips",
@@ -106,6 +109,7 @@ LEGACY_SITE_OVERRIDE_FIELDS = {
     "site_hr_active",
     "site_skip_tips",
     "del_no_free",
+    "promo_max_hours",
     "rss_support",
 }
 
@@ -169,6 +173,7 @@ class BrushTaskConfig:
         self.except_subscribe = bool(config.get("except_subscribe", True))
         self.proxy_delete = bool(config.get("proxy_delete", False))
         self.del_no_free = bool(config.get("del_no_free", False)) if self.freeleech in {"free", "2xfree"} else False
+        self.promo_max_hours = self._parse_number(config.get("promo_max_hours"))
         self.qb_category = self._clean_text(config.get("qb_category"))
         self.site_hr_active = bool(config.get("site_hr_active", False))
         self.site_skip_tips = bool(config.get("site_skip_tips", False))
@@ -213,7 +218,7 @@ class BrushFlowLanduo(_PluginBase):
     plugin_name = "站点刷流-landuo"
     plugin_desc = "自动托管多个站点刷流任务，并独立调度、统计与诊断。"
     plugin_icon = "brush-flow.png"
-    plugin_version = "5.2.5"
+    plugin_version = "5.2.10"
     plugin_author = "jxxghp,landuo"
     author_url = "https://github.com/landuo"
     plugin_config_prefix = "brushflowlanduo_"
@@ -668,19 +673,401 @@ class BrushFlowLanduo(_PluginBase):
             return False, None
         return payload.global_proxy_delete, payload.global_delete_size_range
 
-    @staticmethod
-    def _promotion_expiry_at(freedate_origin: Any, timezone_offset: float) -> Optional[datetime]:
-        """把站点促销截止时间换算为宿主时区中的实际到期时刻"""
-        if not freedate_origin:
+    # 促销截止时间可能来自站点列表页抓取、API 或 RSS 描述，格式差异很大
+    PROMOTION_DATE_PATTERN = re.compile(
+        r"(\d{4})[-/.](\d{1,2})[-/.](\d{1,2})"
+        r"(?:[ T](\d{1,2}):(\d{2})(?::(\d{2}))?)?"
+        r"\s*(Z|UTC|GMT|[+-]\d{2}:?\d{2})?",
+        re.I,
+    )
+    PROMOTION_DURATION_PATTERN = re.compile(r"(\d+)\s*(天|日|小时|时|分钟|分|hours?|hrs?|minutes?|mins?|days?)", re.I)
+    PROMOTION_LABELFREE_PATTERN = re.compile(r"(\d+):(\d{2})(?::(\d{2}))?")
+    # 详情页/列表页的促销剩余时间：绝对截止时间通常放在 title 属性里
+    PROMOTION_PAGE_REMAINING_PATTERN = re.compile(
+        r"剩余时间[^<]{0,40}<span[^>]*title=[\"']([^\"']+)[\"']",
+        re.S,
+    )
+    PROMOTION_PAGE_REMAINING_FALLBACK_PATTERN = re.compile(
+        r"(?:剩余时间|剩余|免费截止|优惠截止|促销截止|Free\s+until|until)\s*[:：]?\s*"
+        r"([0-9]{4}[-/.][0-9]{1,2}[-/.][0-9]{1,2}(?:[ T][0-9]{1,2}:[0-9]{2}(?::[0-9]{2})?)?)",
+        re.I,
+    )
+    # 促销标签：必须是独立的 pro_free / pro_free2up 类，避免匹配到 pro_50pctdown 之类的其他促销
+    PROMOTION_PAGE_MARKER_PATTERN = re.compile(
+        r"class=[\"'][^\"']*?(?<![\w-])pro_(?:free|2up)\b",
+        re.I,
+    )
+    # 站点明确声明“当前没有优惠/不享受促销”
+    PROMOTION_PAGE_NONE_PATTERN = re.compile(r"无优惠|不享受种子促销|不享受促销|无促销")
+    # 详情页促销剩余时间标记（列表页是“剩余时间：”或“剩余：”）
+    PROMOTION_PAGE_REMAINING_HINT_PATTERN = re.compile(r"剩余时间|剩余\s*[:：]")
+    # 只有确实读到种子页面时才允许判定“已无促销”，避免登录页/RSS/错误页导致误删
+    PROMOTION_PAGE_TORRENT_PATTERN = re.compile(
+        r"href=[\"'][^\"']*download\.php\?id=",
+        re.I,
+    )
+    # 同一颗种子的促销信息最长多久重新探测一次
+    PROMOTION_PROBE_INTERVAL = 30 * 60
+    # 已拿到截止时间的种子仍需复核，防止站点提前结束促销
+    # 复核间隔 = min(30 分钟, max(剩余时间 × 15%, 检查周期)) + 抖动，越接近截止时间越密
+    PROMOTION_VERIFY_INTERVAL = 30 * 60
+    PROMOTION_VERIFY_FLOOR = 60
+    PROMOTION_VERIFY_JITTER = 180
+
+    @classmethod
+    def _parse_promotion_deadline(cls, value: Any) -> Optional[Tuple[datetime, Optional[timedelta]]]:
+        """解析站点给出的促销截止文本，返回挂钟时间与文本中显式声明的时区"""
+        if value is None:
+            return None
+        text = str(value).strip()
+        if not text or len(text) > 256:
+            return None
+        match = cls.PROMOTION_DATE_PATTERN.search(text)
+        if not match:
             return None
         try:
-            freedate_text = str(freedate_origin).strip().replace("T", " ").removesuffix("Z")
-            site_expiry = datetime.strptime(freedate_text, "%Y-%m-%d %H:%M:%S")
-            local_expiry = site_expiry + timedelta(hours=timezone_offset)
-            return local_expiry.replace(tzinfo=ZoneInfo(settings.TZ))
-        except (TypeError, ValueError) as err:
-            logger.warning(f"解析促销截止时间失败：{str(err)}")
+            deadline = datetime(
+                int(match.group(1)),
+                int(match.group(2)),
+                int(match.group(3)),
+                int(match.group(4) or 0),
+                int(match.group(5) or 0),
+                int(match.group(6) or 0),
+            )
+        except ValueError:
             return None
+        # 只有日期而没有时刻时，按当天结束处理，避免提前数小时删除
+        if match.group(4) is None:
+            deadline = deadline + timedelta(days=1, seconds=-1)
+        return deadline, cls._parse_promotion_zone(match.group(7))
+
+    @staticmethod
+    def _parse_promotion_zone(token: Optional[str]) -> Optional[timedelta]:
+        """把 Z/UTC/GMT/+0800 等时区标记转换为 UTC 偏移"""
+        if not token:
+            return None
+        normalized = token.strip().upper().replace(" ", "")
+        if normalized in {"Z", "UTC", "GMT"}:
+            return timedelta(0)
+        sign = -1 if normalized.startswith("-") else 1
+        digits = normalized.lstrip("+-").replace(":", "")
+        if len(digits) != 4 or not digits.isdigit():
+            return None
+        hours, minutes = int(digits[:2]), int(digits[2:])
+        if hours > 14 or minutes > 59:
+            return None
+        return sign * timedelta(hours=hours, minutes=minutes)
+
+    @classmethod
+    def _promotion_duration_seconds(cls, value: Any) -> Optional[int]:
+        """解析“2天3小时”“5小时30分”这类剩余时间文本"""
+        if value is None:
+            return None
+        text = str(value).strip()
+        if not text or len(text) > 128:
+            return None
+        total = 0
+        matched = False
+        for amount, unit in cls.PROMOTION_DURATION_PATTERN.findall(text):
+            unit = unit.lower()
+            if unit in {"天", "日", "day", "days"}:
+                factor = 86400
+            elif unit in {"小时", "时", "hour", "hours", "hr", "hrs"}:
+                factor = 3600
+            else:
+                factor = 60
+            total += int(amount) * factor
+            matched = True
+        # MoviePilot 的 freedate_diff 由 timedelta 字符串化得到，例如 "1 day, 2:03:04"
+        clock = cls.PROMOTION_LABELFREE_PATTERN.search(text)
+        if clock:
+            hours, minutes, seconds = (int(clock.group(1)), int(clock.group(2)), int(clock.group(3) or 0))
+            if minutes < 60 and seconds < 60:
+                total += hours * 3600 + minutes * 60 + seconds
+                matched = True
+        return total if matched else None
+
+    @classmethod
+    def _promotion_expiry_from_diff(cls, freedate_diff: Any, added_on: Any) -> Optional[datetime]:
+        """用剩余时间文本和加入下载器的时刻还原促销截止时间"""
+        seconds = cls._promotion_duration_seconds(freedate_diff)
+        if seconds is None:
+            return None
+        try:
+            added_timestamp = float(added_on or 0)
+        except (TypeError, ValueError):
+            return None
+        if added_timestamp <= 0:
+            return None
+        reference = datetime.fromtimestamp(added_timestamp, tz=ZoneInfo(settings.TZ))
+        return reference + timedelta(seconds=seconds)
+
+    @classmethod
+    def _inferred_site_clock_offset(cls, published_at: Optional[datetime], added_on: Any) -> Optional[int]:
+        """按站点发布时间与下载器加入时间的差值推导站点时间与宿主时间的偏差（分钟）"""
+        if published_at is None:
+            return None
+        try:
+            added_timestamp = float(added_on or 0)
+        except (TypeError, ValueError):
+            return None
+        if added_timestamp <= 0:
+            return None
+        # 站点时间文本没有时区信息，这里只比较两个“挂钟读数”，避免宿主时区被重复计入
+        claimed = calendar.timegm(published_at.timetuple())
+        now = time.time()
+        if added_timestamp > now + 60:
+            return None
+        try:
+            host_zone = ZoneInfo(settings.TZ)
+        except Exception:
+            host_zone = timezone.utc
+        host_offset_seconds = (datetime.fromtimestamp(now, host_zone).utcoffset() or timedelta(0)).total_seconds()
+        elapsed = max(now - added_timestamp, 0.0)
+        # 同一瞬间的“站点读数”和“宿主读数”都已在同一参考系中，差值即宿主需要给站点补的偏移
+        # 例：UTC 站点读到 15:49、UTC+8 宿主读到 23:51，则站点时间 + 480 分钟 = 宿主时间
+        offset_minutes = round((host_offset_seconds - (claimed - (now - elapsed))) / 60)
+        if abs(offset_minutes) > 14 * 60:
+            return None
+        # 加入下载器通常紧跟在发布时间之后，个位数分钟的误差通过取整到整点消除
+        return int(round(offset_minutes / 60.0) * 60)
+
+    @classmethod
+    def _promotion_expiry_at(cls, freedate_origin: Any, timezone_offset: float) -> Optional[datetime]:
+        """把站点促销截止时间换算为宿主时区中的实际到期时刻"""
+        parsed = cls._parse_promotion_deadline(freedate_origin)
+        if not parsed:
+            # 部分站点列表页只给“剩余 2小时30分”这类倒计时，只能按当前时刻展开
+            seconds = cls._promotion_duration_seconds(freedate_origin)
+            if seconds is not None:
+                return datetime.now(ZoneInfo(settings.TZ)) + timedelta(seconds=seconds)
+            if freedate_origin:
+                logger.warning(f"解析促销截止时间失败，将无法按截止时间删种：{freedate_origin!r}")
+            return None
+        site_expiry, declared_zone = parsed
+        if declared_zone is not None:
+            # 文本自带时区（如 2026-09-20T12:00:00Z）时直接换算，忽略站点时区配置
+            return site_expiry.replace(tzinfo=timezone(declared_zone)).astimezone(ZoneInfo(settings.TZ))
+        actual_expiry = site_expiry + timedelta(hours=timezone_offset)
+        return actual_expiry.replace(tzinfo=ZoneInfo(settings.TZ))
+
+    def _resolve_promotion_expiry(self, task: BrushTaskConfig, torrent_task: dict) -> Tuple[Optional[datetime], str]:
+        """按本地已有信息解析促销截止时间"""
+        expiry = self._promotion_expiry_at(torrent_task.get("freedate"), task.timezone_offset)
+        if expiry:
+            return expiry, ""
+        diff_expiry = self._promotion_expiry_from_diff(
+            torrent_task.get("freedate_diff"),
+            torrent_task.get("add_on"),
+        )
+        if diff_expiry:
+            return diff_expiry, "剩余时间"
+        return None, ""
+
+    @classmethod
+    def _promotion_verify_due(
+        cls,
+        torrent_task: dict,
+        now: float,
+        expiry: Optional[datetime],
+        check_interval: Any = None,
+    ) -> bool:
+        """判断已拿到截止时间的种子是否该复核站点促销是否仍在进行"""
+        interval_context = check_interval
+        if not torrent_task.get("promotion_probe_at"):
+            # 从未探测过：截止时间来自列表页快照，只会自然过期，无需额外复核
+            return False
+        try:
+            last_probe = float(torrent_task.get("promotion_probe_at") or 0)
+        except (TypeError, ValueError):
+            return False
+        # 越接近截止时间核对越密：固定间隔与剩余时间的 15% 取小，但不超过剩余时间本身
+        # 下限取“最小间隔”与未知任务时长的默认检查周期，避免设置出比检查周期还密的间隔
+        interval = float(cls.PROMOTION_VERIFY_INTERVAL)
+        if expiry:
+            remaining = (expiry - datetime.now(expiry.tzinfo)).total_seconds()
+            floor = max(float(cls.PROMOTION_VERIFY_FLOOR), float(interval_context or 0))
+            interval = min(interval, max(remaining * 0.15, floor, 1.0))
+        jitter = random.uniform(0, cls.PROMOTION_VERIFY_JITTER)
+        return now - last_probe >= interval + jitter
+
+    def _promotion_expiry(
+        self,
+        task: BrushTaskConfig,
+        torrent_info: dict,
+        torrent_task: dict,
+    ) -> Tuple[Optional[datetime], str]:
+        """解析单个种子的促销截止时间，必要时按发布/加入时间校正时区并复核站点促销状态"""
+        # 站点列表页的发布时间是站点本地时间（RSS 发布时间已被主程序换算为宿主时区），
+        # 未显式配置站点时区时按发布时间与加入时间的差值自动校正，避免整体偏移若干小时
+        add_on = torrent_info.get("add_on") or torrent_task.get("add_on")
+        offset_minutes = 0
+        if not task.timezone_offset and not getattr(task, "rss_support", False):
+            try:
+                added_timestamp = float(add_on or 0)
+            except (TypeError, ValueError):
+                added_timestamp = 0
+            offset_minutes = self._inferred_site_clock_offset(
+                self._parse_pubdate(torrent_info.get("pubdate") or torrent_task.get("pubdate")),
+                added_timestamp,
+            )
+        if offset_minutes:
+            expiry = self._promotion_expiry_at(torrent_task.get("freedate"), offset_minutes / 60)
+            source = f"按发布时间自动校正时区 {offset_minutes / 60:+.1f} 小时"
+        else:
+            expiry, source = self._resolve_promotion_expiry(task, torrent_task)
+        if expiry and not self._promotion_verify_due(
+            torrent_task, time.time(), expiry, getattr(task, "check_interval", None)
+        ):
+            return expiry, source
+        # 截止时间缺失，或已到复核间隔：直接读取站点当前促销状态
+        if self._refresh_promotion_from_site(torrent_task):
+            if torrent_task.get("promotion_ended_at"):
+                # 站点已提前结束促销（或倒计时已走完），不再等待原定截止时间
+                return None, "probe_ended"
+            expiry = self._promotion_expiry_at(torrent_task.get("freedate"), offset_minutes / 60) \
+                if offset_minutes else None
+            if not expiry:
+                expiry, source = self._resolve_promotion_expiry(task, torrent_task)
+            return expiry, source
+        if expiry:
+            # 复核未能完成（页面不可用/状态未知）时仍按本地已知截止时间处理
+            return expiry, source
+        return None, ""
+
+    @classmethod
+    def _parse_pubdate(cls, value: Any) -> Optional[datetime]:
+        """解析站点发布时间文本，无法识别时返回 None"""
+        parsed = cls._parse_promotion_deadline(value)
+        return parsed[0] if parsed else None
+
+    def _refresh_promotion_from_site(self, torrent_task: dict) -> bool:
+        """存储的促销截止时间无法判定时，直接读取种子详情页的促销信息补齐"""
+        now = time.time()
+        # 站点已明确没有促销时不再重复请求
+        if torrent_task.get("promotion_ended_at"):
+            return True
+        # 只探测加入时确为免费的种子，避免为普通种子产生无意义请求
+        if not self._record_added_as_free(torrent_task):
+            return False
+        try:
+            last_probe = float(torrent_task.get("promotion_probe_at") or 0)
+        except (TypeError, ValueError):
+            last_probe = 0
+        if now - last_probe < self.PROMOTION_PROBE_INTERVAL:
+            return False
+        page_url = torrent_task.get("page_url")
+        site = self._get_task_site()
+        if not page_url or not site:
+            return False
+        page_url = urljoin(str(site.url or site.domain or ""), str(page_url))
+        try:
+            response = RequestUtils(
+                ua=site.ua or settings.USER_AGENT,
+                cookies=self.__site_cookie(site.cookie),
+                proxies=settings.PROXY if site.proxy else None,
+                timeout=min(int(site.timeout or 15), 30),
+            ).get_res(page_url, allow_redirects=True)
+        except Exception as err:
+            logger.error(f"读取种子促销信息失败：{str(err)}")
+            return False
+        # 无论结果如何都记录探测时间，避免站点不支持时每个检查周期都请求
+        torrent_task["promotion_probe_at"] = now
+        if not response or not getattr(response, "text", None):
+            return False
+        page_text = response.text
+        free_deadline = self.__parse_site_promotion_deadline(page_text)
+        if free_deadline:
+            if free_deadline > datetime.now(ZoneInfo(settings.TZ)):
+                torrent_task["freedate"] = free_deadline.strftime("%Y-%m-%d %H:%M:%S")
+                torrent_task.pop("promotion_ended_at", None)
+                logger.info(f"刷流任务读取到促销截止时间：{torrent_task.get('title')} {torrent_task['freedate']}")
+            else:
+                # 页面上的促销倒计时已经走完，直接视为促销结束
+                torrent_task["promotion_ended_at"] = now
+                logger.info(f"刷流任务探测到促销已结束：{torrent_task.get('title')}")
+            return True
+        if self.__site_page_has_promotion(page_text) or self.__site_page_has_promotion_countdown(page_text):
+            # 页面仍有促销但没有可解析的截止时间（例如永久免费），不视为促销结束
+            return False
+        if not self.__site_page_is_torrent(page_text):
+            # 登录页、RSS、错误页等无法证明促销结束：不判定删除，但同样遵守限频
+            # （Cookie 失效时页面会一直被重定向到登录页，重试过快只会白刷请求）
+            logger.warning(
+                f"刷流任务读取到的不是种子页面，无法确认促销状态：{torrent_task.get('title')}，"
+                "请检查站点 Cookie 是否有效"
+            )
+            return False
+        if not self.__site_page_says_no_promotion(page_text):
+            # 页面只是抓不到促销标记，不能据此断定促销结束（可能是选择器或页面结构变化）
+            logger.warning(
+                f"刷流任务未能确认促销状态：{torrent_task.get('title')}，"
+                "页面既没有促销剩余时间，也没有站点明确的“无优惠”说明"
+            )
+            return False
+        torrent_task["promotion_ended_at"] = now
+        logger.info(f"刷流任务探测到站点已无促销：{torrent_task.get('title')}")
+        return True
+
+    @staticmethod
+    def _record_added_as_free(torrent_task: dict) -> bool:
+        """判断任务记录是否来自免费促销（记录未标记时按任务促销配置判断）"""
+        factor = torrent_task.get("downloadvolumefactor")
+        if factor is not None:
+            try:
+                return float(factor) == 0
+            except (TypeError, ValueError):
+                pass
+        return str(torrent_task.get("volume_factor") or "") in {"免费", "2X免费", "4X免费"}
+
+    @staticmethod
+    def __site_cookie(cookie: Any) -> Optional[dict]:
+        """把站点 Cookie 字符串转换为请求工具需要的字典"""
+        if not cookie:
+            return None
+        if isinstance(cookie, dict):
+            return cookie
+        try:
+            return cookie_parse(str(cookie))
+        except Exception:
+            return None
+
+    @classmethod
+    def __parse_site_promotion_deadline(cls, page_text: str) -> Optional[datetime]:
+        """从站点页面提取促销剩余时间里的绝对截止时间"""
+        for pattern in (cls.PROMOTION_PAGE_REMAINING_PATTERN, cls.PROMOTION_PAGE_REMAINING_FALLBACK_PATTERN):
+            for match in pattern.finditer(page_text):
+                parsed = cls._parse_promotion_deadline(match.group(1))
+                if parsed:
+                    return parsed[0].replace(tzinfo=ZoneInfo(settings.TZ))
+        return None
+
+    @classmethod
+    def __site_page_has_promotion(cls, page_text: str) -> bool:
+        """页面仍显示免费促销标记时返回 True，避免把无关页面当成促销结束"""
+        return bool(cls.PROMOTION_PAGE_MARKER_PATTERN.search(page_text))
+
+    @classmethod
+    def __site_page_says_no_promotion(cls, page_text: str) -> bool:
+        """站点明确声明当前没有优惠时返回 True（例如 ubits 的“盒子促销：无优惠”）"""
+        return bool(cls.PROMOTION_PAGE_NONE_PATTERN.search(page_text))
+
+    @classmethod
+    def __site_page_has_promotion_countdown(cls, page_text: str) -> bool:
+        """页面出现了促销剩余时间标记，说明该种子本身带限时促销"""
+        return bool(cls.PROMOTION_PAGE_REMAINING_HINT_PATTERN.search(page_text))
+
+    @classmethod
+    def __site_page_is_torrent(cls, page_text: str) -> bool:
+        """确认读到的是站点种子页面，而不是登录页、RSS 或错误页"""
+        return bool(cls.PROMOTION_PAGE_TORRENT_PATTERN.search(page_text))
+
+    def _get_task_site(self) -> Optional[Any]:
+        """返回当前任务绑定的站点对象"""
+        task = self._get_task_config()
+        if not task or not task.site_id:
+            return None
+        return SiteOper().get(task.site_id)
 
     def _next_promotion_expiry(self, task: BrushTaskConfig) -> Optional[datetime]:
         """返回任务中下一项未完成下载的促销截止时间"""
@@ -699,7 +1086,10 @@ class BrushFlowLanduo(_PluginBase):
                 total_size = downloaded = 0
             if total_size > 0 and downloaded >= total_size:
                 continue
-            expiry = self._promotion_expiry_at(torrent_task.get("freedate"), task.timezone_offset)
+            expiry, source = self._promotion_expiry(task, torrent_task, torrent_task)
+            if source == "probe_ended":
+                # 促销已提前结束：交给周期检查立即删除，这里不再排期
+                continue
             if expiry and expiry > now:
                 expiries.append(expiry)
         return min(expiries) if expiries else None
@@ -1707,6 +2097,10 @@ class BrushFlowLanduo(_PluginBase):
                     "uploaded": torrent_info.get("uploaded"),
                     "ratio": torrent_info.get("ratio"),
                     "seeding_time": torrent_info.get("seeding_time"),
+                    # 促销截止时间相关字段：freedate 可能为空或只有倒计时文本，
+                    # add_on 用于自动校正站点时区，也用于兜底清理长期未完成的种子
+                    "add_on": torrent_info.get("add_on") or torrent_task.get("add_on"),
+                    "pubdate": torrent_task.get("pubdate") or torrent_info.get("pubdate"),
                 }
             )
 
@@ -1820,11 +2214,46 @@ class BrushFlowLanduo(_PluginBase):
             or torrent_info.get("downloaded", 0) >= torrent_info.get("total_size", 0)
         ):
             return False, ""
-        expiry = self._promotion_expiry_at(torrent_task.get("freedate"), task.timezone_offset)
-        if not expiry:
+        expiry, source = self._promotion_expiry(task, torrent_info, torrent_task)
+        if source == "probe_ended":
+            # 站点已提前结束促销或倒计时已走完，不再等待原定截止时间
+            return True, "站点已无促销且下载未完成"
+        if expiry:
+            if datetime.now(expiry.tzinfo) >= expiry:
+                return True, f"促销已过期（{source}）" if source else "促销已过期"
             return False, ""
-        expired = datetime.now(expiry.tzinfo) >= expiry
-        return expired, "促销已过期" if expired else ""
+        # 站点没有给出可解析的截止时间且无法自动校正时区时，按配置的兜底时长清理长期未完成的免费种子
+        fallback_hours = getattr(task, "promo_max_hours", None)
+        if fallback_hours:
+            torrent_added_on = torrent_info.get("add_on") or torrent_task.get("add_on")
+            try:
+                added_timestamp = float(torrent_added_on or 0)
+            except (TypeError, ValueError):
+                added_timestamp = 0
+            if added_timestamp > 0 and time.time() - added_timestamp >= float(fallback_hours) * 3600:
+                return True, f"促销截止时间未知，超过兜底时长 {fallback_hours} 小时仍未完成下载"
+        self.__log_promotion_unverified(torrent_info, torrent_task)
+        return False, ""
+
+    def __log_promotion_unverified(self, torrent_info: dict, torrent_task: dict) -> None:
+        """促销截止时间缺失或无法解析时限频提示，避免用户误以为删除功能已经生效"""
+        torrent_hash = torrent_info.get("hash") or torrent_task.get("hash") or torrent_task.get("title")
+        now = time.time()
+        warned_at = getattr(self, "_promotion_warned_at", None)
+        if warned_at is None:
+            warned_at = self._promotion_warned_at = {}
+        warn_lock = getattr(self, "_promotion_warn_lock", None)
+        if warn_lock is None:
+            warn_lock = self._promotion_warn_lock = threading.Lock()
+        with warn_lock:
+            if now - warned_at.get(torrent_hash, 0) < 6 * 3600:
+                return
+            warned_at[torrent_hash] = now
+        logger.warning(
+            f"刷流任务删除促销过期种子：{torrent_task.get('title')} 的促销截止时间缺失或无法解析"
+            f"（freedate={torrent_task.get('freedate')!r}，freedate_diff={torrent_task.get('freedate_diff')!r}），"
+            "该种子暂不会按促销截止时间删除，请检查站点时区或站点促销选择器配置"
+        )
 
     def __delete_torrent_for_evaluate_conditions(
         self,
