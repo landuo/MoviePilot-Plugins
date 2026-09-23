@@ -218,7 +218,7 @@ class BrushFlowLanduo(_PluginBase):
     plugin_name = "站点刷流-landuo"
     plugin_desc = "自动托管多个站点刷流任务，并独立调度、统计与诊断。"
     plugin_icon = "brush-flow.png"
-    plugin_version = "5.2.10"
+    plugin_version = "5.2.11"
     plugin_author = "jxxghp,landuo"
     author_url = "https://github.com/landuo"
     plugin_config_prefix = "brushflowlanduo_"
@@ -1135,6 +1135,13 @@ class BrushFlowLanduo(_PluginBase):
             return False
         client.torrents_delete_tags(tags=tags)
         return True
+
+    def _cleanup_temporary_qbittorrent_tag(self, service: Any, tag: str) -> None:
+        """Hash 查询结束后删除一次性 qBittorrent 标签，失败不影响加种结果。"""
+        try:
+            self._delete_qbittorrent_tags(service, tag)
+        except Exception as err:
+            logger.warning(f"清理 qBittorrent 临时标签 [{tag}] 失败：{str(err)}")
 
     def _cleanup_unused_task_tag(
         self,
@@ -2927,26 +2934,29 @@ class BrushFlowLanduo(_PluginBase):
             up_limit = up_speed * 1024 if up_speed else None
             down_limit = down_speed * 1024 if down_speed else None
             random_tag = StringUtils.generate_random_str(10)
-            if isinstance(torrent_content, str) and not torrent_content.startswith("magnet"):
-                response = RequestUtils(cookies=cookies, proxies=proxies, ua=torrent.site_ua).get_res(
-                    url=torrent_content
-                )
-                if response and response.ok:
-                    torrent_content = response.content
-            if not downloader.add_torrent(
-                content=torrent_content,
-                download_dir=task.save_path,
-                cookie=cookies,
-                category=task.qb_category,
-                tag=["已整理", self.GLOBAL_BRUSH_TAG, task.brush_tag, random_tag],
-                upload_limit=up_limit,
-                download_limit=down_limit,
-            ):
-                return None
-            torrent_hash = downloader.get_torrent_id_by_tag(tags=random_tag)
-            if not torrent_hash:
-                logger.error(f"刷流任务 [{task.name}] 获取种子 Hash 失败")
-            return torrent_hash
+            try:
+                if isinstance(torrent_content, str) and not torrent_content.startswith("magnet"):
+                    response = RequestUtils(cookies=cookies, proxies=proxies, ua=torrent.site_ua).get_res(
+                        url=torrent_content
+                    )
+                    if response and response.ok:
+                        torrent_content = response.content
+                if not downloader.add_torrent(
+                    content=torrent_content,
+                    download_dir=task.save_path,
+                    cookie=cookies,
+                    category=task.qb_category,
+                    tag=["已整理", self.GLOBAL_BRUSH_TAG, task.brush_tag, random_tag],
+                    upload_limit=up_limit,
+                    download_limit=down_limit,
+                ):
+                    return None
+                torrent_hash = downloader.get_torrent_id_by_tag(tags=random_tag)
+                if not torrent_hash:
+                    logger.error(f"刷流任务 [{task.name}] 获取种子 Hash 失败")
+                return torrent_hash
+            finally:
+                self._cleanup_temporary_qbittorrent_tag(service, random_tag)
         if downloader_helper.is_downloader("transmission", service=service):
             if isinstance(torrent_content, str) and not torrent_content.startswith("magnet"):
                 response = RequestUtils(cookies=cookies, proxies=proxies, ua=torrent.site_ua).get_res(

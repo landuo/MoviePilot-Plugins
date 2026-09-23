@@ -258,7 +258,7 @@ class BrushFlowLanduo(_PluginBase):
     # 插件图标
     plugin_icon = "brush.jpg"
     # 插件版本
-    plugin_version = "3.8.1"
+    plugin_version = "3.8.2"
     # 插件作者
     plugin_author = "jxxghp,landuo"
     # 作者主页
@@ -3151,6 +3151,15 @@ class BrushFlowLanduo(_PluginBase):
                 return data
         return None
 
+    def _cleanup_temporary_qbittorrent_tag(self, tag: str) -> None:
+        """Hash 查询结束后删除一次性 qBittorrent 标签，失败不影响加种结果。"""
+        try:
+            client = getattr(self.qb, "qbc", None)
+            if client and tag:
+                client.torrents_delete_tags(tags=tag)
+        except Exception as err:
+            logger.warning(f"清理 qBittorrent 临时标签 [{tag}] 失败：{str(err)}")
+
     def __download(self, torrent: TorrentInfo) -> Optional[str]:
         """
         添加下载任务
@@ -3192,35 +3201,37 @@ class BrushFlowLanduo(_PluginBase):
             down_speed = down_speed * 1024 if down_speed else None
             # 生成随机Tag
             tag = StringUtils.generate_random_str(10)
-            # 如果开启代理下载以及种子地址不是磁力地址，则请求种子到内存再传入下载器
-            if brush_config.proxy_download and not torrent_content.startswith("magnet"):
-                response = RequestUtils(cookies=cookies,
-                                        proxies=proxies,
-                                        ua=torrent.site_ua).get_res(url=torrent_content)
-                if response and response.ok:
-                    torrent_content = response.content
-                else:
-                    logger.error('尝试通过MP下载种子失败，继续尝试传递种子地址到下载器进行下载')
-            if torrent_content:
-                state = self.__qb_add_torrent(content=torrent_content,
-                                              download_dir=download_dir,
-                                              cookie=cookies,
-                                              tag=["已整理", brush_config.brush_tag, tag],
-                                              category=brush_config.qb_category,
-                                              is_auto=brush_config.auto_qb_category,
-                                              is_first_last_piece_priority=brush_config.qb_first_last_piece,
-                                              upload_limit=up_speed,
-                                              download_limit=down_speed)
-                if not state:
-                    return None
-                else:
+            try:
+                # 如果开启代理下载以及种子地址不是磁力地址，则请求种子到内存再传入下载器
+                if brush_config.proxy_download and not torrent_content.startswith("magnet"):
+                    response = RequestUtils(cookies=cookies,
+                                            proxies=proxies,
+                                            ua=torrent.site_ua).get_res(url=torrent_content)
+                    if response and response.ok:
+                        torrent_content = response.content
+                    else:
+                        logger.error('尝试通过MP下载种子失败，继续尝试传递种子地址到下载器进行下载')
+                if torrent_content:
+                    state = self.__qb_add_torrent(content=torrent_content,
+                                                  download_dir=download_dir,
+                                                  cookie=cookies,
+                                                  tag=["已整理", brush_config.brush_tag, tag],
+                                                  category=brush_config.qb_category,
+                                                  is_auto=brush_config.auto_qb_category,
+                                                  is_first_last_piece_priority=brush_config.qb_first_last_piece,
+                                                  upload_limit=up_speed,
+                                                  download_limit=down_speed)
+                    if not state:
+                        return None
                     # 获取种子Hash
                     torrent_hash = self.qb.get_torrent_id_by_tag(tags=tag)
                     if not torrent_hash:
                         logger.error(f"{brush_config.downloader} 获取种子Hash失败，详细信息请查看 README")
                         return None
                     return torrent_hash
-            return None
+                return None
+            finally:
+                self._cleanup_temporary_qbittorrent_tag(tag)
 
         elif brush_config.downloader == "transmission":
             if not self.tr:
