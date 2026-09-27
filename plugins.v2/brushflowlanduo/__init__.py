@@ -218,7 +218,7 @@ class BrushFlowLanduo(_PluginBase):
     plugin_name = "站点刷流-landuo"
     plugin_desc = "自动托管多个站点刷流任务，并独立调度、统计与诊断。"
     plugin_icon = "brush-flow.png"
-    plugin_version = "5.2.12"
+    plugin_version = "5.2.13"
     plugin_author = "jxxghp,landuo"
     author_url = "https://github.com/landuo"
     plugin_config_prefix = "brushflowlanduo_"
@@ -684,7 +684,7 @@ class BrushFlowLanduo(_PluginBase):
     PROMOTION_LABELFREE_PATTERN = re.compile(r"(\d+):(\d{2})(?::(\d{2}))?")
     # 详情页/列表页的促销剩余时间：绝对截止时间通常放在 title 属性里
     PROMOTION_PAGE_REMAINING_PATTERN = re.compile(
-        r"剩余时间[^<]{0,40}<span[^>]*title=[\"']([^\"']+)[\"']",
+        r"剩余时间[^<]{0,40}(?:<b\b[^>]*>\s*)?<span[^>]*title=[\"']([^\"']+)[\"']",
         re.S,
     )
     PROMOTION_PAGE_REMAINING_FALLBACK_PATTERN = re.compile(
@@ -692,9 +692,9 @@ class BrushFlowLanduo(_PluginBase):
         r"([0-9]{4}[-/.][0-9]{1,2}[-/.][0-9]{1,2}(?:[ T][0-9]{1,2}:[0-9]{2}(?::[0-9]{2})?)?)",
         re.I,
     )
-    # 促销标签：必须是独立的 pro_free / pro_free2up 类，避免匹配到 pro_50pctdown 之类的其他促销
+    # NexusPHP 站点分别使用 pro_free、free、promotion-tag-free 等独立类名
     PROMOTION_PAGE_MARKER_PATTERN = re.compile(
-        r"class=[\"'][^\"']*?(?<![\w-])pro_free(?:2up)?\b",
+        r"class=[\"'][^\"']*?(?<![\w-])(?:pro_free(?:2up)?|free|promotion-tag-(?:2x)?free)(?![\w-])",
         re.I,
     )
     # NexusPHP 同一详情页下方的其它版本列表不属于当前种子
@@ -964,6 +964,11 @@ class BrushFlowLanduo(_PluginBase):
         if not page_url or not site:
             return False
         page_url = urljoin(str(site.url or site.domain or ""), str(page_url))
+        parsed_page = urlparse(page_url)
+        mteam_id = re.fullmatch(r"/detail/(\d+)", parsed_page.path)
+        if mteam_id and re.fullmatch(r"(?:kp|api2?)\.m-team\.(?:cc|io)", parsed_page.hostname or ""):
+            return self._refresh_mteam_promotion(torrent_task, site, mteam_id.group(1),
+                                                 parsed_page.hostname, timezone_offset, now)
         try:
             response = RequestUtils(
                 ua=site.ua or settings.USER_AGENT,
@@ -983,10 +988,6 @@ class BrushFlowLanduo(_PluginBase):
                 "请检查站点 Cookie 是否有效"
             )
             return False
-        if self.__site_page_says_no_promotion(page_text):
-            torrent_task["promotion_ended_at"] = now
-            logger.info(f"刷流任务探测到站点已无促销：{torrent_task.get('title')}")
-            return True
         free_deadline = self.__parse_site_promotion_deadline(page_text, timezone_offset)
         if free_deadline:
             if free_deadline > datetime.now(ZoneInfo(settings.TZ)):
@@ -1004,6 +1005,11 @@ class BrushFlowLanduo(_PluginBase):
                 torrent_task["promotion_ended_at"] = now
                 logger.info(f"刷流任务探测到促销已结束：{torrent_task.get('title')}")
             return True
+        # UBits 页面可能同时出现“种子免费”和“盒子促销：无优惠”，不能先用盒子说明判定种子过期
+        if self.__site_page_says_no_promotion(page_text) and not self.__site_page_has_promotion(page_text):
+            torrent_task["promotion_ended_at"] = now
+            logger.info(f"刷流任务探测到站点已无促销：{torrent_task.get('title')}")
+            return True
         if self.__site_page_has_promotion(page_text) or self.__site_page_has_promotion_countdown(page_text):
             # 页面可能仍有免费，但没有可靠的截止时间，必须暂停而不是继续下载
             return False
@@ -1012,6 +1018,64 @@ class BrushFlowLanduo(_PluginBase):
             "页面既没有促销剩余时间，也没有站点明确的“无优惠”说明"
         )
         return False
+
+    def _refresh_mteam_promotion(self, torrent_task: dict, site: Any, torrent_id: str,
+                                 page_host: str, timezone_offset: float, now: float) -> bool:
+        """用 M-Team 官方 API 复核动态详情页对应种子的实时优惠。"""
+        api_key = getattr(site, "apikey", None)
+        if not api_key:
+            logger.warning("M-Team 站点未配置 API Key，无法核实种子促销")
+            return False
+        configured_host = urlparse(str(site.url or "")).hostname or ""
+        api_host = (configured_host if re.fullmatch(r"api2?\.m-team\.(?:cc|io)", configured_host)
+                    else f"api.m-team.{page_host.rsplit('.', 1)[-1]}")
+        try:
+            response = RequestUtils(
+                ua=site.ua or settings.USER_AGENT,
+                proxies=settings.PROXY if site.proxy else None,
+                timeout=min(int(site.timeout or 15), 30),
+            ).post_res(f"https://{api_host}/api/torrent/detail", data={"id": torrent_id},
+                       headers={"x-api-key": api_key})
+            payload = response.json() if response else None
+        except Exception as err:
+            logger.error(f"读取 M-Team 种子促销信息失败：{str(err)}")
+            return False
+        if not isinstance(payload, dict) or str(payload.get("code")) != "0":
+            return False
+        data = payload.get("data")
+        if not isinstance(data, dict) or str(data.get("id")) != torrent_id:
+            return False
+        status = data.get("status")
+        if not isinstance(status, dict):
+            return False
+        discount = status.get("discount")
+        raw_deadline = status.get("discountEndTime")
+        promotion_rule = status.get("promotionRule")
+        if isinstance(promotion_rule, dict):
+            discount = promotion_rule.get("discount")
+            raw_deadline = promotion_rule.get("endTime")
+        mall_single_free = status.get("mallSingleFree")
+        if isinstance(mall_single_free, dict) and mall_single_free.get("status") == "ONGOING":
+            discount = "FREE"
+            raw_deadline = mall_single_free.get("endDate")
+        if discount is None:
+            return False
+        discount = str(discount).upper().replace("_", "")
+        if discount not in {"FREE", "2XFREE", "FREE2X"}:
+            torrent_task["promotion_ended_at"] = now
+            return True
+        if not self._parse_promotion_deadline(raw_deadline):
+            return False
+        deadline = self._promotion_expiry_at(raw_deadline, timezone_offset)
+        if not deadline:
+            return False
+        if deadline <= datetime.now(ZoneInfo(settings.TZ)):
+            torrent_task["promotion_ended_at"] = now
+            return True
+        torrent_task["freedate"] = deadline.isoformat()
+        torrent_task["promotion_verified_at"] = now
+        torrent_task.pop("promotion_ended_at", None)
+        return True
 
     @staticmethod
     def _record_added_as_free(torrent_task: dict) -> bool:

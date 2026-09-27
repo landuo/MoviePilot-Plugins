@@ -9,7 +9,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, Dict, List, Optional, Tuple
-from urllib.parse import urljoin
+from urllib.parse import urljoin, urlparse
 from zoneinfo import ZoneInfo
 
 
@@ -34,6 +34,7 @@ METHOD_NAMES = {
     "_run_check",
     "_parse_pubdate",
     "_refresh_promotion_from_site",
+    "_refresh_mteam_promotion",
     "_get_task_site",
     "_record_added_as_free",
     "__site_cookie",
@@ -89,6 +90,7 @@ def load_promotion_harness(host_tz: str = "Asia/Shanghai", request_utils=None):
         "random": random,
         "calendar": calendar,
         "urljoin": urljoin,
+        "urlparse": urlparse,
         "re": re,
         "logger": SimpleNamespace(
             warning=lambda *args, **kwargs: WARNINGS.append(" ".join(str(item) for item in args)),
@@ -501,8 +503,12 @@ class UbitsMarkupTests(unittest.TestCase):
 
 
 class FakeResponse:
-    def __init__(self, text):
+    def __init__(self, text, payload=None):
         self.text = text
+        self.payload = payload
+
+    def json(self):
+        return self.payload
 
 
 class RecordingRequestUtils:
@@ -554,8 +560,8 @@ class SiteProbeTests(unittest.TestCase):
         "<span title=\"2099-01-01 00:00:00\">23时1分钟</span></b></font>"
     )
 
-    def build(self, page_text, record=None, site=None):
-        response = FakeResponse(page_text)
+    def build(self, page_text, record=None, site=None, api_response=None):
+        response = FakeResponse(page_text, api_response)
 
         class Recorder(RecordingRequestUtils):
             calls = []
@@ -563,6 +569,10 @@ class SiteProbeTests(unittest.TestCase):
             def get_res(self, url, **kwargs):
                 self.url = url
                 Recorder.calls.append({"url": url, **self.kwargs})
+                return response
+
+            def post_res(self, url, **kwargs):
+                Recorder.calls.append({"url": url, **kwargs, **self.kwargs})
                 return response
 
         # RequestUtils 必须在装载测试宿主之前注入，方法与模块共享同一命名空间
@@ -606,6 +616,89 @@ class SiteProbeTests(unittest.TestCase):
         instance, _, record = self.build(self.UBITS_PAGE, site=site)
         self.assertTrue(instance._refresh_promotion_from_site(record))
         self.assertEqual(record["freedate"], "2099-01-01T00:00:00+08:00")
+
+    def test_live_nexus_free_markup_passes_candidate_check(self):
+        """三个站点详情页的真实免费标记都必须通过加种前复核。"""
+        deadline = (datetime.now(ZoneInfo(HOST_TZ)) + timedelta(hours=2)).strftime("%Y-%m-%d %H:%M:%S")
+        pages = {
+            "UBits": (
+                f'<h1 id="top"><b>[<font class="free">免费</font>]</b> '
+                f'<b>剩余时间：<span title="{deadline}">2时</span></b></h1>'
+                "<a href='download.php?id=1'>下载</a>"
+                "<span title='盒子当前不享受种子促销'>盒子促销：无优惠</span>"
+            ),
+            "HHClub": (
+                "<a href='download.php?id=1'>下载</a>"
+                '<span class="promotion-tag promotion-tag-free">免费</span> '
+                f'剩余时间：<span title="{deadline}">2时</span>'
+            ),
+            "HDHome": (
+                f'<h1 id="top"><b>[<font class="free">免费</font>]</b> '
+                f'剩余时间：<b><span title="{deadline}">2时</span></b></h1>'
+                "<a href='download.php?id=1'>下载</a>"
+            ),
+        }
+        task = SimpleNamespace(del_no_free=True, timezone_offset=0, rss_support=True)
+        for name, page in pages.items():
+            with self.subTest(site=name):
+                site = SimpleNamespace(url=f"https://{name.lower()}.example", domain="example",
+                                       cookie=None, ua=None, proxy=0, timeout=15)
+                instance, _, record = self.build(page, site=site)
+                record["add_on"] = time.time()
+                self.assertTrue(instance._verify_candidate_promotion(record, task))
+                self.assertTrue(record.get("promotion_verified_at"))
+
+    def test_mteam_api_verifies_discount_for_matching_torrent(self):
+        """M-Team 是 API 站点，不能要求动态详情页包含 Nexus 下载链接。"""
+        deadline = (datetime.now(ZoneInfo(HOST_TZ)) + timedelta(hours=2)).strftime("%Y-%m-%d %H:%M:%S")
+        site = SimpleNamespace(url="https://kp.m-team.cc/", domain="m-team.cc", apikey="test-key",
+                               cookie=None, ua=None, proxy=0, timeout=15)
+        payload = {"code": "0", "data": {"id": "1261073", "status": {
+            "discount": "FREE", "discountEndTime": deadline,
+        }}}
+        record = {"title": "M-Team 免费种子", "page_url": "https://kp.m-team.cc/detail/1261073",
+                  "downloadvolumefactor": 0, "add_on": time.time()}
+        task = SimpleNamespace(del_no_free=True, timezone_offset=0, rss_support=True)
+        instance, recorder, record = self.build("", record=record, site=site, api_response=payload)
+        self.assertTrue(instance._verify_candidate_promotion(record, task))
+        self.assertEqual(recorder.calls[0]["url"], "https://api.m-team.cc/api/torrent/detail")
+        self.assertEqual(recorder.calls[0]["data"], {"id": "1261073"})
+        self.assertEqual(recorder.calls[0]["headers"], {"x-api-key": "test-key"})
+        self.assertTrue(record.get("promotion_verified_at"))
+
+        for status in ({"discount": "_2X_FREE", "discountEndTime": deadline},
+                       {"discount": "NORMAL", "promotionRule": {
+                           "discount": "FREE", "endTime": deadline,
+                       }},
+                       {"discount": "NORMAL", "mallSingleFree": {
+                           "status": "ONGOING", "endDate": deadline,
+                       }}):
+            with self.subTest(active_promotion=status):
+                payload["data"]["status"] = status
+                instance, _, candidate = self.build("", record=dict(record, promotion_probe_at=0),
+                                                    site=site, api_response=payload)
+                candidate.pop("promotion_verified_at", None)
+                self.assertTrue(instance._verify_candidate_promotion(candidate, task))
+
+        for status in ({"discount": "PERCENT_50", "discountEndTime": deadline},
+                       {"discount": "FREE", "discountEndTime": None},
+                       {"discount": "FREE", "discountEndTime": deadline,
+                        "promotionRule": {"discount": "NORMAL"}},
+                       {"discount": "NORMAL", "promotionRule": {"discount": "FREE"}}):
+            with self.subTest(status=status):
+                payload["data"]["status"] = status
+                instance, _, candidate = self.build("", record=dict(record, promotion_probe_at=0),
+                                                    site=site, api_response=payload)
+                candidate.pop("promotion_verified_at", None)
+                candidate.pop("promotion_ended_at", None)
+                self.assertFalse(instance._verify_candidate_promotion(candidate, task))
+
+        payload["data"]["id"] = "different"
+        payload["data"]["status"] = {"discount": "FREE", "discountEndTime": deadline}
+        instance, _, candidate = self.build("", record=dict(record, promotion_probe_at=0),
+                                            site=site, api_response=payload)
+        candidate.pop("promotion_verified_at", None)
+        self.assertFalse(instance._verify_candidate_promotion(candidate, task))
 
     def test_probe_is_throttled_within_interval(self):
         site = SimpleNamespace(url="https://ubits.club", domain="ubits.club", cookie=None, ua=None, proxy=0, timeout=15)
