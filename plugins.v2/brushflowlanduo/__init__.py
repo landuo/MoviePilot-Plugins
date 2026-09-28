@@ -218,7 +218,7 @@ class BrushFlowLanduo(_PluginBase):
     plugin_name = "站点刷流-landuo"
     plugin_desc = "自动托管多个站点刷流任务，并独立调度、统计与诊断。"
     plugin_icon = "brush-flow.png"
-    plugin_version = "5.2.13"
+    plugin_version = "5.2.14"
     plugin_author = "jxxghp,landuo"
     author_url = "https://github.com/landuo"
     plugin_config_prefix = "brushflowlanduo_"
@@ -461,15 +461,14 @@ class BrushFlowLanduo(_PluginBase):
                     "func_kwargs": {"task_id": task.id},
                 }
             )
-            promotion_expiry = self._next_promotion_expiry(task)
-            if promotion_expiry:
+            if task.del_no_free:
                 services.append(
                     {
                         "id": f"Task_{task.id}_PromotionExpiry",
                         "name": f"促销到期检查 - {task.name}",
-                        "trigger": "date",
+                        "trigger": "interval",
                         "func": self._check_promotion_expiry,
-                        "kwargs": {"run_date": promotion_expiry},
+                        "kwargs": {"minutes": 1},
                         "func_kwargs": {"task_id": task.id},
                     }
                 )
@@ -1140,7 +1139,7 @@ class BrushFlowLanduo(_PluginBase):
         return SiteOper().get(task.site_id)
 
     def _next_promotion_expiry(self, task: BrushTaskConfig) -> Optional[datetime]:
-        """返回任务中下一项需要提前停下未完成下载的时刻"""
+        """返回下一项需要检查的提前停下载或详情页复核时刻"""
         if not task.del_no_free:
             return None
         now = datetime.now(ZoneInfo(settings.TZ))
@@ -1158,19 +1157,33 @@ class BrushFlowLanduo(_PluginBase):
                 continue
             if not torrent_task.get("promotion_verified_at") and not torrent_task.get("promotion_paused_at"):
                 # 升级前的托管记录尚未核验过详情页，启动后尽快停下潜在计费下载
-                expiries.append(now + timedelta(seconds=5))
+                expiries.append(now)
                 continue
             expiry, source = self._promotion_expiry(task, torrent_task, torrent_task, verify_site=False)
             if source == "probe_ended":
-                expiries.append(now + timedelta(seconds=5))
+                expiries.append(now)
             elif expiry:
                 stop_at = expiry - timedelta(seconds=self.PROMOTION_STOP_MARGIN)
-                expiries.append(max(stop_at, now + timedelta(seconds=5)))
+                expiries.append(stop_at)
+            if torrent_task.get("promotion_verified_at") and source != "probe_ended":
+                try:
+                    last_probe = float(torrent_task.get("promotion_probe_at") or 0)
+                except (TypeError, ValueError):
+                    last_probe = 0
+                expiries.append(
+                    datetime.fromtimestamp(last_probe + self.PROMOTION_VERIFY_INTERVAL, now.tzinfo)
+                    if last_probe > 0 else now
+                )
         return min(expiries) if expiries else None
 
     def _check_promotion_expiry(self, task_id: str) -> None:
-        """在最近促销截止时等待当前操作结束，检查后重排下一截止任务"""
-        self.check(task_id, wait_for_lock=True)
+        """仅用本地记录检查截止和复核时间；到期时才运行种子检查。"""
+        task = self._get_task_config(task_id)
+        if not task or not self.get_state() or not task.enabled or not task.del_no_free:
+            return
+        expiry = self._next_promotion_expiry(task)
+        if expiry and expiry <= datetime.now(ZoneInfo(settings.TZ)):
+            self.check(task_id, wait_for_lock=True)
 
     def _validate_task_reference(self, task: BrushTaskConfig, notify: bool = True) -> bool:
         """校验任务引用的私有站点和下载器是否仍然存在"""
@@ -1732,8 +1745,6 @@ class BrushFlowLanduo(_PluginBase):
             self._append_run(task.id, report)
             self._set_runtime(task.id, state="idle", operation=None)
             task_lock.release()
-            if report.get("added_count"):
-                self._refresh_scheduler()
 
     def _run_brush(self, task: BrushTaskConfig, report: dict) -> None:
         """在已绑定任务上下文中执行刷流核心流程"""
@@ -2126,9 +2137,6 @@ class BrushFlowLanduo(_PluginBase):
         report["finished_at"] = self._now_iso()
         self._append_run(task.id, report)
         self._set_runtime(task.id, state="idle", operation=None)
-        if task.del_no_free and report.get("success"):
-            # 详情页可能更改截止时间，周期检查后同步重排提前清理任务
-            self._refresh_scheduler()
 
     def _run_check(self, task: BrushTaskConfig, report: dict) -> None:
         """在已绑定任务上下文中执行刷流种子检查"""

@@ -5,6 +5,7 @@ import re
 import threading
 import time
 import unittest
+from contextlib import nullcontext
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from types import SimpleNamespace
@@ -18,6 +19,8 @@ PLUGIN_PATH = Path(__file__).parents[3] / "plugins.v2" / "brushflowlanduo" / "__
 # 每次装载测试宿主前收集 logger.warning，用于断言“失败不再静默”
 WARNINGS: list = []
 METHOD_NAMES = {
+    "brush",
+    "check",
     "get_service",
     "_parse_promotion_deadline",
     "_parse_promotion_zone",
@@ -31,6 +34,7 @@ METHOD_NAMES = {
     "_verify_candidate_promotion",
     "_protect_promotion_downloads",
     "_next_promotion_expiry",
+    "_check_promotion_expiry",
     "_run_check",
     "_parse_pubdate",
     "_refresh_promotion_from_site",
@@ -952,19 +956,57 @@ class PromotionSafetyFlowTests(unittest.TestCase):
         instance.brush = lambda **kwargs: None
         instance.check = lambda **kwargs: None
         instance._check_promotion_expiry = lambda **kwargs: None
-        expiry = datetime.now(ZoneInfo(HOST_TZ)) + timedelta(hours=2)
-        instance._next_promotion_expiry = lambda current_task: expiry
+        instance._get_task_data = lambda *args: {}
         services = instance.get_service()
         regular_check = next(item for item in services if item["id"].endswith("_Check"))
         expiry_check = next(item for item in services if item["id"].endswith("_PromotionExpiry"))
         self.assertEqual(regular_check["kwargs"], {"minutes": 15})
-        self.assertEqual(expiry_check["kwargs"]["run_date"], expiry,
-                         "定时复核变慢不能取消已知截止时间的单独清理任务")
+        self.assertEqual(expiry_check["trigger"], "interval")
+        self.assertEqual(expiry_check["kwargs"], {"minutes": 1},
+                         "截止时间只需轻量检查本地记录，不得重建周期任务")
 
         task.del_no_free = False
         services = instance.get_service()
         regular_check = next(item for item in services if item["id"].endswith("_Check"))
         self.assertEqual(regular_check["kwargs"], {"minutes": task.check_interval})
+        self.assertFalse(any(item["id"].endswith("_PromotionExpiry") for item in services))
+
+    def test_expiry_wakeup_only_checks_when_recorded_deadline_is_due(self):
+        instance = load_promotion_harness()["BrushFlowHarness"]()
+        task = self.task(enabled=True)
+        instance._get_task_config = lambda task_id=None: task
+        instance.get_state = lambda: True
+        calls = []
+        instance.check = lambda task_id, wait_for_lock=False: calls.append((task_id, wait_for_lock))
+        now = datetime.now(ZoneInfo(HOST_TZ))
+        instance._next_promotion_expiry = lambda current_task: now + timedelta(hours=1)
+        instance._check_promotion_expiry(task.id)
+        self.assertEqual(calls, [], "没有临近截止时间时不应发起站点复核")
+
+        instance._next_promotion_expiry = lambda current_task: now - timedelta(seconds=1)
+        instance._check_promotion_expiry(task.id)
+        self.assertEqual(calls, [(task.id, True)])
+
+    def test_regular_checks_and_additions_do_not_reset_other_task_timers(self):
+        instance = load_promotion_harness()["BrushFlowHarness"]()
+        task = self.task(enabled=True)
+        instance._get_task_config = lambda task_id=None: task
+        instance.get_state = lambda: True
+        instance._task_locks = {}
+        instance._brush_lock = threading.Lock()
+        instance._task_scope = lambda task_id: nullcontext()
+        instance._new_run_report = lambda kind: {"kind": kind}
+        instance._set_runtime = lambda *args, **kwargs: None
+        instance._append_run = lambda *args, **kwargs: None
+        instance._run_brush = lambda current_task, report: report.update(result="completed", added_count=1)
+        instance._run_check = lambda current_task, report: report.update(result="completed")
+        instance._global_dynamic_delete_enabled = lambda: False
+        rebuilds = []
+        instance._refresh_scheduler = lambda: rebuilds.append(task.id)
+
+        instance.brush(task.id)
+        instance.check(task.id)
+        self.assertEqual(rebuilds, [], "例行运行不应重建全部任务，否则其它站点的 15 分钟计时会重置")
 
     def test_candidate_needs_verified_future_deadline(self):
         task = self.task()
@@ -1001,15 +1043,32 @@ class PromotionSafetyFlowTests(unittest.TestCase):
     def test_next_expiry_is_ten_minutes_early_without_network_probe(self):
         task = self.task()
         instance = load_promotion_harness()["BrushFlowHarness"]()
-        future = datetime.now(ZoneInfo(HOST_TZ)) + timedelta(minutes=30)
+        future = datetime.now(ZoneInfo(HOST_TZ)) + timedelta(minutes=20)
         instance._get_task_data = lambda task_id, key: {
             "hash": {"freedate": future.strftime("%Y-%m-%d %H:%M:%S"), "size": 1000,
                      "downloaded": 100, "downloadvolumefactor": 0,
-                     "promotion_verified_at": time.time()}
+                     "promotion_verified_at": time.time(), "promotion_probe_at": time.time()}
         }
         scheduled = instance._next_promotion_expiry(task)
         self.assertIsNotNone(scheduled)
         self.assertLess(abs((scheduled - (future - timedelta(minutes=10))).total_seconds()), 2)
+
+    def test_next_probe_follows_each_torrents_last_verification(self):
+        task = self.task()
+        instance = load_promotion_harness()["BrushFlowHarness"]()
+        now = time.time()
+        future = datetime.now(ZoneInfo(HOST_TZ)) + timedelta(hours=2)
+        record = {"freedate": future.strftime("%Y-%m-%d %H:%M:%S"), "size": 1000,
+                  "downloaded": 100, "downloadvolumefactor": 0,
+                  "promotion_verified_at": now, "promotion_probe_at": now}
+        instance._get_task_data = lambda task_id, key: {"hash": record}
+        scheduled = instance._next_promotion_expiry(task)
+        expected = datetime.fromtimestamp(now + instance.PROMOTION_VERIFY_INTERVAL, ZoneInfo(HOST_TZ))
+        self.assertLess(abs((scheduled - expected).total_seconds()), 2)
+
+        record["promotion_probe_at"] = now - instance.PROMOTION_VERIFY_INTERVAL - 1
+        self.assertLessEqual(instance._next_promotion_expiry(task), datetime.now(ZoneInfo(HOST_TZ)),
+                             "复核时间错开任务周期时，也应按种子上次复核时间触发")
 
     def test_unverified_old_record_is_checked_soon_after_startup(self):
         task = self.task()
@@ -1019,7 +1078,19 @@ class PromotionSafetyFlowTests(unittest.TestCase):
                      "downloaded": 100, "downloadvolumefactor": 0}
         }
         scheduled = instance._next_promotion_expiry(task)
-        self.assertLess((scheduled - datetime.now(ZoneInfo(HOST_TZ))).total_seconds(), 10)
+        self.assertLessEqual(scheduled, datetime.now(ZoneInfo(HOST_TZ)),
+                             "旧记录未核实促销时，下一轮轻量到期检查应立即触发安全检查")
+
+    def test_overdue_record_is_checked_by_next_expiry_wakeup(self):
+        task = self.task()
+        instance = load_promotion_harness()["BrushFlowHarness"]()
+        past = datetime.now(ZoneInfo(HOST_TZ)) - timedelta(minutes=30)
+        instance._get_task_data = lambda task_id, key: {
+            "hash": {"freedate": past.strftime("%Y-%m-%d %H:%M:%S"), "size": 1000,
+                     "downloaded": 100, "downloadvolumefactor": 0,
+                     "promotion_verified_at": time.time()}
+        }
+        self.assertLessEqual(instance._next_promotion_expiry(task), datetime.now(ZoneInfo(HOST_TZ)))
 
     def run_check(self, record, *, stop_result=True, delete_result=True, torrent=None, dynamic=True):
         task = self.task()
