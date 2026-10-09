@@ -13,6 +13,9 @@ develop-eggs/
 dist/
 !plugins.v2/brushflowlanduo/dist/
 !plugins.v2/brushflowlanduo/dist/**
+!plugins.v2/seedrescue/dist/
+!plugins.v2/seedrescue/dist/**
+node_modules/
 downloads/
 eggs/
 .eggs/
