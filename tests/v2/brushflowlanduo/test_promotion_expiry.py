@@ -19,6 +19,7 @@ PLUGIN_PATH = Path(__file__).parents[3] / "plugins.v2" / "brushflowlanduo" / "__
 # 每次装载测试宿主前收集 logger.warning，用于断言“失败不再静默”
 WARNINGS: list = []
 METHOD_NAMES = {
+    "_torrent_complete",
     "brush",
     "check",
     "get_service",
@@ -389,6 +390,28 @@ class PromotionExpiredTests(unittest.TestCase):
             {"freedate": past},
         )
         self.assertFalse(expired)
+
+    def test_reused_files_with_no_download_traffic_are_complete(self):
+        instance = self.build(self.make_task())
+        past = (datetime.now(ZoneInfo(HOST_TZ)) - timedelta(hours=1)).isoformat()
+        info = {"progress": 1, "downloaded": 0, "total_size": 1000}
+        self.assertTrue(instance._torrent_complete(info))
+        expired, _ = instance._BrushFlowHarness__promotion_expired(info, {"freedate": past})
+        self.assertFalse(expired)
+
+    def test_redownload_traffic_does_not_override_incomplete_files(self):
+        instance = self.build(self.make_task())
+        past = (datetime.now(ZoneInfo(HOST_TZ)) - timedelta(hours=1)).isoformat()
+        info = {"progress": 0.5, "downloaded": 2000, "total_size": 1000}
+        self.assertFalse(instance._torrent_complete(info))
+        expired, _ = instance._BrushFlowHarness__promotion_expired(info, {"freedate": past})
+        self.assertTrue(expired)
+
+    def test_invalid_progress_is_not_assumed_complete(self):
+        instance = self.build(self.make_task())
+        for progress in ("invalid", float("nan"), 0.999):
+            with self.subTest(progress=progress):
+                self.assertFalse(instance._torrent_complete({"progress": progress, "size": 1000, "downloaded": 2000}))
 
     def test_unknown_total_size_is_not_assumed_completed(self):
         instance = self.build(self.make_task())
