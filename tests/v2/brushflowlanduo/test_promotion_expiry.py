@@ -27,7 +27,7 @@ METHOD_NAMES = {
     "_parse_promotion_zone",
     "_promotion_duration_seconds",
     "_promotion_expiry_from_diff",
-    "_inferred_site_clock_offset",
+    "_invalidate_legacy_promotion_clocks",
     "_promotion_expiry_at",
     "_resolve_promotion_expiry",
     "_promotion_verify_due",
@@ -37,7 +37,6 @@ METHOD_NAMES = {
     "_next_promotion_expiry",
     "_check_promotion_expiry",
     "_run_check",
-    "_parse_pubdate",
     "_refresh_promotion_from_site",
     "_refresh_mteam_promotion",
     "_get_task_site",
@@ -229,58 +228,70 @@ class PromotionDurationTests(unittest.TestCase):
 
 
 class SiteClockOffsetTests(unittest.TestCase):
-    """站点时间与宿主时间的偏差必须能自动推导，避免删除时间整体偏移若干小时"""
+    """发布时间无法证明站点时区；只接受显式时区与任务配置。"""
 
     def setUp(self):
         self.plugin = load_promotion_harness()["BrushFlowHarness"]()
 
-    def infer(self, published_at: datetime, added_on: float):
-        return self.plugin._inferred_site_clock_offset(published_at, added_on)
+    def test_delayed_candidates_keep_detail_deadline(self):
+        """同一时区等待 53 分钟或 1–4 小时后加种，不能推迟详情页免费截止时间。"""
+        now = datetime.now(ZoneInfo(HOST_TZ)).replace(microsecond=0)
+        deadline = now + timedelta(hours=8)
+        page = ("<a href='download.php?id=223714'>下载</a>"
+                '<span class="promotion-tag promotion-tag-free">免费</span>'
+                f'剩余时间：<span title="{deadline:%Y-%m-%d %H:%M:%S}">8小时</span>')
+        task = SimpleNamespace(del_no_free=True, timezone_offset=0, rss_support=False)
+        for delay in (53 * 60, 3600, 7200, 10800, 14400):
+            with self.subTest(delay=delay):
+                site = SimpleNamespace(url="https://hhanclub.net/", domain="hhanclub.net",
+                                       cookie=None, ua=None, proxy=0, timeout=15)
+                instance, _, record = SiteProbeTests().build(page, site=site)
+                record.update(pubdate=(now - timedelta(seconds=delay)).strftime("%Y-%m-%d %H:%M:%S"),
+                              add_on=now.timestamp())
+                self.assertTrue(instance._verify_candidate_promotion(record, task))
+                self.assertEqual(datetime.fromisoformat(record["freedate"]), deadline)
 
-    def test_utc_site_on_shanghai_host(self):
-        """UTC 站点在 UTC+8 宿主上应得到 +480 分钟：站点时间 + 480 分钟 = 宿主时间"""
-        now = datetime.now(ZoneInfo(HOST_TZ))
-        published_site_local = (now - timedelta(minutes=30)).astimezone(ZoneInfo("UTC")).replace(tzinfo=None)
-        offset = self.infer(published_site_local, now.timestamp() - 28 * 60)
-        self.assertEqual(offset, 480)
+    def test_configured_cross_zone_offsets(self):
+        for host, offset, expected in (("Asia/Shanghai", 8, 20), ("Asia/Shanghai", 6, 18),
+                                       ("UTC", 0, 12), ("America/New_York", -4, 8)):
+            with self.subTest(host=host):
+                plugin = load_promotion_harness(host_tz=host)["BrushFlowHarness"]()
+                self.assertEqual(plugin._promotion_expiry_at("2026-10-28 12:00:00", offset).hour, expected)
 
-    def test_same_zone_site_on_shanghai_host(self):
-        now = datetime.now(ZoneInfo(HOST_TZ))
-        offset = self.infer(now.replace(tzinfo=None) - timedelta(minutes=30), now.timestamp() - 28 * 60)
-        self.assertEqual(offset, 0)
+    def test_declared_zone_overrides_config(self):
+        for raw in ("2026-10-29T02:04:48+08:00", "2026-10-28T18:04:48Z"):
+            self.assertEqual(self.plugin._promotion_expiry_at(raw, 6).isoformat(),
+                             "2026-10-29T02:04:48+08:00")
 
-    def test_utc_plus_two_site_on_shanghai_host(self):
-        """UTC+2 站点在 UTC+8 宿主上应得到 +360 分钟"""
-        now = datetime.now(ZoneInfo(HOST_TZ))
-        published_site_local = (now - timedelta(minutes=30)).astimezone(ZoneInfo("Etc/GMT-2")).replace(tzinfo=None)
-        offset = self.infer(published_site_local, now.timestamp() - 29 * 60)
-        self.assertEqual(offset, 360)
-
-    def test_utc_site_on_utc_host(self):
-        plugin = load_promotion_harness(host_tz="UTC")["BrushFlowHarness"]()
-        now = datetime.now(ZoneInfo("UTC"))
-        offset = plugin._inferred_site_clock_offset(now.replace(tzinfo=None) - timedelta(minutes=10), now.timestamp() - 600)
-        self.assertEqual(offset, 0)
-
-    def test_utc_site_on_new_york_host(self):
-        plugin = load_promotion_harness(host_tz="America/New_York")["BrushFlowHarness"]()
-        now = datetime.now(ZoneInfo("America/New_York"))
-        published_site_local = (now - timedelta(minutes=20)).astimezone(ZoneInfo("UTC")).replace(tzinfo=None)
-        offset = plugin._inferred_site_clock_offset(published_site_local, now.timestamp() - 18 * 60)
-        self.assertEqual(offset, -240)
-
-    def test_offset_is_stable_for_late_additions(self):
-        """间隔较久才加入下载器时，四舍五入到整点仍应得到正确时区"""
-        now = datetime.now(ZoneInfo(HOST_TZ))
-        published_site_local = (now - timedelta(hours=6)).astimezone(ZoneInfo("UTC")).replace(tzinfo=None)
-        offset = self.infer(published_site_local, now.timestamp() - 5 * 3600)
-        # 加入时刻与发布时刻存在数小时误差时仍能推导出小时级时区（允许整点取整带来的 1 小时误差）
-        self.assertIn(abs(offset), {420, 480, 540})
-
-    def test_missing_inputs_are_ignored(self):
-        self.assertIsNone(self.infer(None, time.time()))
-        self.assertIsNone(self.infer(datetime.now(), 0))
-        self.assertIsNone(self.infer(datetime.now(), time.time() + 86400))
+    def test_upgrade_discards_old_shifted_clock_and_reprobes(self):
+        now = time.time()
+        task = SimpleNamespace(id="hh", del_no_free=True, timezone_offset=0)
+        wrong = {"freedate": "2099-01-01T03:04:48+08:00", "freedate_diff": "8小时",
+                 "promotion_verified_at": now, "promotion_probe_at": now,
+                 "downloadvolumefactor": 0, "page_url": "https://hhanclub.net/details.php?id=223714"}
+        current = dict(wrong, promotion_clock_version=2)
+        deleted = dict(wrong, deleted=True)
+        records = {"old": wrong, "current": current, "deleted": deleted}
+        self.plugin._task_configs = {task.id: task}
+        self.plugin._get_task_data = lambda *args: records
+        saves = []
+        self.plugin._save_task_data = lambda *args: saves.append(args)
+        self.plugin._invalidate_legacy_promotion_clocks()
+        self.assertNotIn("freedate", wrong)
+        self.assertNotIn("promotion_verified_at", wrong)
+        self.assertNotIn("promotion_probe_at", wrong)
+        self.assertIn("freedate", current)
+        self.assertIn("freedate", deleted)
+        self.assertEqual(len(saves), 1)
+        site = SimpleNamespace(url="https://hhanclub.net/", domain="hhanclub.net", cookie=None,
+                               ua=None, proxy=0, timeout=15)
+        page = ("<a href='download.php?id=223714'>下载</a><img class='pro_free' alt='Free'>"
+                '剩余时间：<span title="2099-01-01 02:04:48">8小时</span>')
+        instance, recorder, record = SiteProbeTests().build(page, record=wrong, site=site)
+        self.assertTrue(instance._refresh_promotion_from_site(record))
+        self.assertEqual(record["freedate"], "2099-01-01T02:04:48+08:00")
+        self.assertEqual(record["promotion_clock_version"], 2)
+        self.assertEqual(len(recorder.calls), 1)
 
 
 class PromotionExpiredTests(unittest.TestCase):
@@ -333,9 +344,9 @@ class PromotionExpiredTests(unittest.TestCase):
         self.assertFalse(expired)
         self.assertEqual(reason, "")
 
-    def test_utc_site_deadline_is_auto_corrected(self):
-        """站点显示 UTC、任务时区留 0 时，UTC 截止时间必须换算到宿主时区再判断"""
-        instance = self.build(self.make_task())
+    def test_utc_site_deadline_uses_configured_offset(self):
+        """无时区后缀的 UTC 站点必须显式配置 +8，不能从发布/加种间隔猜测。"""
+        instance = self.build(self.make_task(timezone_offset=8))
         now = datetime.now(ZoneInfo(HOST_TZ))
         published_utc = (now - timedelta(minutes=20)).astimezone(ZoneInfo("UTC")).replace(tzinfo=None)
         # 超过 10 分钟安全余量时可以继续；余量内应提前停下
@@ -363,7 +374,7 @@ class PromotionExpiredTests(unittest.TestCase):
             {"freedate": past_utc.strftime("%Y-%m-%d %H:%M:%S")},
         )
         self.assertTrue(expired, "UTC 站点的过期截止时间必须被识别，否则种子会被计费下载")
-        self.assertIn("自动校正", reason)
+        self.assertIn("促销", reason)
 
     def test_rss_task_is_not_auto_corrected(self):
         """RSS 发布时间已被主程序换算为宿主时区，不能再做时区校正"""

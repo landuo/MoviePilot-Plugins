@@ -45,9 +45,11 @@ class FakeDownloader:
         self.qbc = FakeQbClient(fail_delete=fail_delete)
         self.torrent_hash = torrent_hash
         self.added_tags = None
+        self.added_paused = None
 
     def add_torrent(self, **kwargs):
         self.added_tags = kwargs["tag"]
+        self.added_paused = kwargs.get("is_paused")
         return True
 
     def get_torrent_id_by_tag(self, tags):
@@ -120,6 +122,7 @@ class TemporaryTagTests(unittest.TestCase):
             save_path=None,
             qb_category=None,
             brush_tag="刷流-task",
+            del_no_free=True,
         )
 
     def test_v2_deletes_temporary_global_tag_after_hash_lookup(self):
@@ -145,6 +148,7 @@ class TemporaryTagTests(unittest.TestCase):
         result = plugin._BrushFlowHarness__download(self.torrent())
 
         self.assertEqual(result, "hash-1")
+        self.assertTrue(downloader.added_paused, "促销保护任务必须先暂停加种，再保存托管记录并启动")
         self.assertIn("abcdefghij", downloader.added_tags)
         self.assertEqual(downloader.qbc.deleted_tags, ["abcdefghij"])
 

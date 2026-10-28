@@ -1,5 +1,4 @@
 import base64
-import calendar
 import json
 import random
 import re
@@ -218,7 +217,7 @@ class BrushFlowLanduo(_PluginBase):
     plugin_name = "站点刷流-landuo"
     plugin_desc = "自动托管多个站点刷流任务，并独立调度、统计与诊断。"
     plugin_icon = "brush-flow.png"
-    plugin_version = "5.2.15"
+    plugin_version = "5.2.16"
     plugin_author = "jxxghp,landuo"
     author_url = "https://github.com/landuo"
     plugin_config_prefix = "brushflowlanduo_"
@@ -281,6 +280,7 @@ class BrushFlowLanduo(_PluginBase):
         if migrated or raw_config != normalized:
             self.update_config(normalized)
         self._migrate_legacy_data()
+        self._invalidate_legacy_promotion_clocks()
 
         # V5 为任务增加了唯一标签；启动时回收升级前已经失去任务配置的孤立标签。
         if self._enabled:
@@ -713,6 +713,26 @@ class BrushFlowLanduo(_PluginBase):
     PROMOTION_STOP_MARGIN = 10 * 60
     # 每 15 分钟复核正在下载的免费种子；未能核实时停止下载
     PROMOTION_VERIFY_INTERVAL = 15 * 60
+    PROMOTION_CLOCK_VERSION = 2
+
+    def _invalidate_legacy_promotion_clocks(self) -> None:
+        """旧版本可能按加种延迟推迟过截止时间，必须重新读详情页，不能沿用核验结果。"""
+        for task in self._task_configs.values():
+            if not task.del_no_free:
+                continue
+            records = self._get_task_data(task.id, "torrents") or {}
+            changed = False
+            for record in records.values():
+                if (not isinstance(record, dict) or record.get("deleted")
+                        or record.get("promotion_clock_version") == self.PROMOTION_CLOCK_VERSION
+                        or record.get("promotion_clock_invalidated")):
+                    continue
+                for field in ("freedate", "freedate_diff", "promotion_verified_at", "promotion_probe_at"):
+                    record.pop(field, None)
+                record["promotion_clock_invalidated"] = True
+                changed = True
+            if changed:
+                self._save_task_data(task.id, "torrents", records)
 
     @classmethod
     def _parse_promotion_deadline(cls, value: Any) -> Optional[Tuple[datetime, Optional[timedelta]]]:
@@ -803,36 +823,6 @@ class BrushFlowLanduo(_PluginBase):
         return reference + timedelta(seconds=seconds)
 
     @classmethod
-    def _inferred_site_clock_offset(cls, published_at: Optional[datetime], added_on: Any) -> Optional[int]:
-        """按站点发布时间与下载器加入时间的差值推导站点时间与宿主时间的偏差（分钟）"""
-        if published_at is None:
-            return None
-        try:
-            added_timestamp = float(added_on or 0)
-        except (TypeError, ValueError):
-            return None
-        if added_timestamp <= 0:
-            return None
-        # 站点时间文本没有时区信息，这里只比较两个“挂钟读数”，避免宿主时区被重复计入
-        claimed = calendar.timegm(published_at.timetuple())
-        now = time.time()
-        if added_timestamp > now + 60:
-            return None
-        try:
-            host_zone = ZoneInfo(settings.TZ)
-        except Exception:
-            host_zone = timezone.utc
-        host_offset_seconds = (datetime.fromtimestamp(now, host_zone).utcoffset() or timedelta(0)).total_seconds()
-        elapsed = max(now - added_timestamp, 0.0)
-        # 同一瞬间的“站点读数”和“宿主读数”都已在同一参考系中，差值即宿主需要给站点补的偏移
-        # 例：UTC 站点读到 15:49、UTC+8 宿主读到 23:51，则站点时间 + 480 分钟 = 宿主时间
-        offset_minutes = round((host_offset_seconds - (claimed - (now - elapsed))) / 60)
-        if abs(offset_minutes) > 14 * 60:
-            return None
-        # 加入下载器通常紧跟在发布时间之后，个位数分钟的误差通过取整到整点消除
-        return int(round(offset_minutes / 60.0) * 60)
-
-    @classmethod
     def _promotion_expiry_at(cls, freedate_origin: Any, timezone_offset: float) -> Optional[datetime]:
         """把站点促销截止时间换算为宿主时区中的实际到期时刻"""
         parsed = cls._parse_promotion_deadline(freedate_origin)
@@ -896,51 +886,25 @@ class BrushFlowLanduo(_PluginBase):
         torrent_task: dict,
         verify_site: bool = True,
     ) -> Tuple[Optional[datetime], str]:
-        """解析单个种子的促销截止时间，必要时按发布/加入时间校正时区并复核站点促销状态"""
+        """仅按显式时区或站点时区配置解析截止时间，并复核当前促销。"""
         if torrent_task.get("promotion_ended_at"):
             return None, "probe_ended"
-        # 站点列表页的发布时间是站点本地时间（RSS 发布时间已被主程序换算为宿主时区），
-        # 未显式配置站点时区时按发布时间与加入时间的差值自动校正，避免整体偏移若干小时
-        add_on = torrent_info.get("add_on") or torrent_task.get("add_on")
-        offset_minutes = 0
-        if not task.timezone_offset and not getattr(task, "rss_support", False):
-            try:
-                added_timestamp = float(add_on or 0)
-            except (TypeError, ValueError):
-                added_timestamp = 0
-            offset_minutes = self._inferred_site_clock_offset(
-                self._parse_pubdate(torrent_info.get("pubdate") or torrent_task.get("pubdate")),
-                added_timestamp,
-            )
-        if offset_minutes and self._parse_promotion_deadline(torrent_task.get("freedate")):
-            expiry = self._promotion_expiry_at(torrent_task.get("freedate"), offset_minutes / 60)
-            source = f"按发布时间自动校正时区 {offset_minutes / 60:+.1f} 小时"
-        else:
-            expiry, source = self._resolve_promotion_expiry(task, torrent_task)
+        expiry, source = self._resolve_promotion_expiry(task, torrent_task)
         if not verify_site or (expiry and not self._promotion_verify_due(
             torrent_task, time.time(), expiry, getattr(task, "check_interval", None)
         )):
             return expiry, source
         # 截止时间缺失，或已到复核间隔：直接读取站点当前促销状态
-        if self._refresh_promotion_from_site(torrent_task, offset_minutes / 60 if offset_minutes else task.timezone_offset):
+        if self._refresh_promotion_from_site(torrent_task, task.timezone_offset):
             if torrent_task.get("promotion_ended_at"):
                 # 站点已提前结束促销（或倒计时已走完），不再等待原定截止时间
                 return None, "probe_ended"
-            expiry = self._promotion_expiry_at(torrent_task.get("freedate"), offset_minutes / 60) \
-                if offset_minutes and self._parse_promotion_deadline(torrent_task.get("freedate")) else None
-            if not expiry:
-                expiry, source = self._resolve_promotion_expiry(task, torrent_task)
+            expiry, source = self._resolve_promotion_expiry(task, torrent_task)
             return expiry, source
         if expiry:
             # 截止时间仍供提前删除使用；调用方会因本次复核失败暂停下载
             return expiry, source
         return None, ""
-
-    @classmethod
-    def _parse_pubdate(cls, value: Any) -> Optional[datetime]:
-        """解析站点发布时间文本，无法识别时返回 None"""
-        parsed = cls._parse_promotion_deadline(value)
-        return parsed[0] if parsed else None
 
     def _refresh_promotion_from_site(self, torrent_task: dict, timezone_offset: float = 0) -> bool:
         """读取当前种子详情页并更新促销状态；无法验证时保持保守状态"""
@@ -997,6 +961,8 @@ class BrushFlowLanduo(_PluginBase):
                     return False
                 torrent_task["freedate"] = free_deadline.isoformat()
                 torrent_task["promotion_verified_at"] = now
+                torrent_task["promotion_clock_version"] = self.PROMOTION_CLOCK_VERSION
+                torrent_task.pop("promotion_clock_invalidated", None)
                 torrent_task.pop("promotion_ended_at", None)
                 logger.info(f"刷流任务读取到促销截止时间：{torrent_task.get('title')} {torrent_task['freedate']}")
             else:
@@ -1073,6 +1039,8 @@ class BrushFlowLanduo(_PluginBase):
             return True
         torrent_task["freedate"] = deadline.isoformat()
         torrent_task["promotion_verified_at"] = now
+        torrent_task["promotion_clock_version"] = self.PROMOTION_CLOCK_VERSION
+        torrent_task.pop("promotion_clock_invalidated", None)
         torrent_task.pop("promotion_ended_at", None)
         return True
 
@@ -1873,6 +1841,16 @@ class BrushFlowLanduo(_PluginBase):
                 continue
             torrent_tasks[hash_string] = torrent_task
             all_torrent_tasks[hash_string] = torrent_task
+            if task.del_no_free:
+                # 下载器先暂停加种；持久化后才允许启动，进程在任意一步退出都不会留下无记录下载。
+                self._save_current_task_data("torrents", torrent_tasks)
+                expiry, _ = self._resolve_promotion_expiry(task, torrent_task)
+                if (not expiry or time.time() - float(torrent_task.get("promotion_verified_at") or 0) >= self.PROMOTION_VERIFY_INTERVAL
+                        or datetime.now(expiry.tzinfo) + timedelta(seconds=self.PROMOTION_STOP_MARGIN) >= expiry
+                        or not self.downloader.start_torrents(ids=[hash_string])):
+                    torrent_task["promotion_paused_at"] = time.time()
+                    self._save_current_task_data("torrents", torrent_tasks)
+                    logger.warning(f"刷流任务 [{task.name}] 新种子保持暂停，需重新核实促销后恢复：{torrent.title}")
             seeding_size += torrent.size
             global_seeding_size += torrent.size
             report["added_count"] += 1
@@ -1894,12 +1872,7 @@ class BrushFlowLanduo(_PluginBase):
 
     def _verify_candidate_promotion(self, torrent_task: dict, task: BrushTaskConfig) -> bool:
         """添加下载前复核当前种子的免费促销及安全截止时间。"""
-        site_offset = task.timezone_offset
-        if not site_offset and not task.rss_support:
-            site_offset = (self._inferred_site_clock_offset(
-                self._parse_pubdate(torrent_task.get("pubdate")), torrent_task.get("add_on")
-            ) or 0) / 60
-        if not self._refresh_promotion_from_site(torrent_task, site_offset):
+        if not self._refresh_promotion_from_site(torrent_task, task.timezone_offset):
             return False
         if torrent_task.get("promotion_ended_at") or not torrent_task.get("promotion_verified_at"):
             return False
@@ -2267,7 +2240,7 @@ class BrushFlowLanduo(_PluginBase):
                     "ratio": torrent_info.get("ratio"),
                     "seeding_time": torrent_info.get("seeding_time"),
                     # 促销截止时间相关字段：freedate 可能为空或只有倒计时文本，
-                    # add_on 用于自动校正站点时区，也用于兜底清理长期未完成的种子
+                    # add_on 用于倒计时快照与长期未完成种子的时长限制
                     "add_on": torrent_info.get("add_on") or torrent_task.get("add_on"),
                     "pubdate": torrent_task.get("pubdate") or torrent_info.get("pubdate"),
                 }
@@ -3104,6 +3077,7 @@ class BrushFlowLanduo(_PluginBase):
                         torrent_content = response.content
                 if not downloader.add_torrent(
                     content=torrent_content,
+                    is_paused=bool(getattr(task, "del_no_free", False)),
                     download_dir=task.save_path,
                     cookie=cookies,
                     category=task.qb_category,
@@ -3127,6 +3101,7 @@ class BrushFlowLanduo(_PluginBase):
                     torrent_content = response.content
             added_torrent = downloader.add_torrent(
                 content=torrent_content,
+                is_paused=bool(getattr(task, "del_no_free", False)),
                 download_dir=task.save_path,
                 cookie=cookies,
                 labels=["已整理", self.GLOBAL_BRUSH_TAG, task.brush_tag],
