@@ -200,6 +200,20 @@ class IndependentGuardTests(unittest.TestCase):
         self.assertEqual(result["would_pause"], 1)
         self.assertEqual(self.server.stops, [])
 
+    def test_cold_guard_reads_checkpointed_db_after_moviepilot_stops(self):
+        self.db.close()
+        self.assertFalse(Path(str(self.database) + "-wal").exists())
+        self.database.chmod(0o400)
+        Path(self.temp.name).chmod(0o500)
+        try:
+            snapshot = self.loader()
+            self.assertEqual(len(snapshot), 1)
+            self.assertEqual(snapshot[0][0]["id"], TASK["id"])
+            self.assertEqual(list(Path(self.temp.name).iterdir()), [self.database])
+            self.assertEqual(guard.Guard(self.loader).run_once()["paused"], 1)
+        finally:
+            Path(self.temp.name).chmod(0o700)
+
     def test_torrent_finishing_before_stop_is_not_paused(self):
         self.server.finish_on_recheck = True
         guard.Guard(self.loader).run_once()

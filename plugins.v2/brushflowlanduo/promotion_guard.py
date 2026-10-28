@@ -38,7 +38,14 @@ def number(value):
 
 def read_snapshot(database, task_ids):
     """Read config and records in one consistent SQLite transaction, including WAL."""
-    with closing(sqlite3.connect(f"{Path(database).resolve().as_uri()}?mode=ro", uri=True, timeout=5)) as db:
+    database = Path(database).resolve()
+    wal = Path(str(database) + "-wal")
+    checkpointed = not wal.exists()
+    # A clean MoviePilot shutdown removes WAL/SHM. SQLite otherwise tries to
+    # create them even for mode=ro, which is impossible on the read-only mount.
+    # Only the checkpointed main DB may use immutable; never ignore a live WAL.
+    uri = f"{database.as_uri()}?mode=ro" + ("&immutable=1" if checkpointed else "")
+    with closing(sqlite3.connect(uri, uri=True, timeout=5)) as db:
         db.execute("PRAGMA query_only=ON")
         db.execute("BEGIN")
         config_row = db.execute("SELECT value FROM systemconfig WHERE key=?",
@@ -61,6 +68,8 @@ def read_snapshot(database, task_ids):
                              ("BrushFlowLanduo", f"task.{task['id']}.torrents")).fetchone()
             records = json.loads(row[0]) if row else {}
             snapshot.append((task, records, downloader))
+        if checkpointed and wal.exists():
+            raise sqlite3.OperationalError("WAL appeared during checkpointed snapshot")
         return snapshot
 
 
