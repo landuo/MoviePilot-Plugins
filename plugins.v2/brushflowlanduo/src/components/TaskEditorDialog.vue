@@ -252,9 +252,9 @@ async function saveTask() {
                     <VTextField
                       v-model.number="localTask.timezone_offset"
                       type="number"
-                      label="站点时区偏移（小时，留 0 自动推导）"
+                      label="站点时区偏移（小时）"
                       placeholder="站点时间 + 偏移 = 本机时间"
-                      hint="例如站点用 UTC、本机为 UTC+8 时填 8"
+                      hint="同一时区填 0；站点用 UTC、本机为 UTC+8 时填 8"
                       persistent-hint
                     />
                   </VCol>

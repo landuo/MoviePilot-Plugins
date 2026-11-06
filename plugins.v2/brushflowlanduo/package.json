@@ -1,7 +1,7 @@
 {
   "name": "moviepilot-brushflow-landuo-plugin",
   "private": true,
-  "version": "5.2.17",
+  "version": "5.2.18",
   "type": "module",
   "scripts": {
     "dev": "vite build --watch",
@@ -12,7 +12,7 @@
     "vuetify": "3.7.3"
   },
   "devDependencies": {
-    "@originjs/vite-plugin-federation": "^1.4.1",
+    "@module-federation/vite": "^1.23.10",
     "@vitejs/plugin-vue": "^5.0.4",
     "vite": "^5.4.11"
   }

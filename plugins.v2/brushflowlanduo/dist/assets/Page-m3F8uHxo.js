@@ -1,8 +1,5 @@
-import { importShared } from './__federation_fn_import-JrT3xvdd.js';
-import { B as BrushFlowWorkbench } from './BrushFlowWorkbench-Bm62dbu_.js';
-
-const {openBlock:_openBlock,createBlock:_createBlock} = await importShared('vue');
-
+import { a as __mf_19, b as __mf_9 } from './_plugin-vue_export-helper-1_Y3tC5L.js';
+import { B as BrushFlowWorkbench } from './BrushFlowWorkbench-Bmyw-FFf.js';
 
 const _sfc_main = {
   __name: 'Page',
@@ -17,7 +14,7 @@ const _sfc_main = {
 
 
 return (_ctx, _cache) => {
-  return (_openBlock(), _createBlock(BrushFlowWorkbench, {
+  return (__mf_19(), __mf_9(BrushFlowWorkbench, {
     api: __props.api,
     "plugin-id": "BrushFlowLanduo",
     "show-close": "",
